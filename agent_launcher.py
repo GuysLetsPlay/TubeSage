@@ -12,9 +12,11 @@ import subprocess
 import time
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-PENDING_DIR = BASE_DIR / "knowledge" / "pending"
-PROMPT_TEMPLATE = BASE_DIR / "AGENT_PROMPT.md"
+from app_paths import DATA_DIR, RESOURCE_DIR
+
+BASE_DIR = DATA_DIR
+PENDING_DIR = DATA_DIR / "knowledge" / "pending"
+PROMPT_TEMPLATE = RESOURCE_DIR / "AGENT_PROMPT.md"
 
 CLI_CANDIDATES = ["codex", "cline", "opencode"]
 

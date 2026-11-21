@@ -12,8 +12,9 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-BIN_DIR = BASE_DIR / "bin"
+from app_paths import DATA_DIR
+
+BIN_DIR = DATA_DIR / "bin"
 
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"

@@ -12,8 +12,9 @@ import time
 import uuid
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-KB_DIR = BASE_DIR / "knowledge"
+from app_paths import DATA_DIR
+
+KB_DIR = DATA_DIR / "knowledge"
 PENDING_DIR = KB_DIR / "pending"
 PROCESSED_DIR = KB_DIR / "processed"
 STORE = KB_DIR / "solutions.json"

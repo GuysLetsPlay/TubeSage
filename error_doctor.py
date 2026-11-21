@@ -1,21 +1,27 @@
-"""Error Doctor: signature extraction + auto Telegram/GitHub search.
-
-Telegram search wraps the authorized MTProto reader in
-C:\\Dev\\telegram-reader (see its AGENTS.md). GitHub search uses the public
-REST API (no key needed).
-"""
+"""Error Doctor: signature extraction + optional Telegram/GitHub search."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-TG_PYTHON = Path(r"C:\Dev\telegram-reader\.venv\Scripts\python.exe")
-TG_DIR = Path(r"C:\Dev\telegram-reader")
+
+def telegram_reader_paths() -> tuple[Path, Path]:
+    """Find the optional Telegram helper without requiring a developer path."""
+    configured = os.environ.get("TUBESAGE_TELEGRAM_READER")
+    if configured:
+        root = Path(configured).expanduser()
+    elif not getattr(sys, "frozen", False):
+        root = Path(__file__).resolve().parent.parent / "telegram-reader"
+    else:
+        root = Path.home() / "telegram-reader"
+    return root / ".venv" / "Scripts" / "python.exe", root
 DEFAULT_GROUP = "YTDLNIS"
 DEFAULT_TOPIC = "general"
 UA = {"User-Agent": "TubeSage/1.0"}
@@ -104,17 +110,18 @@ def search_telegram(query: str, limit: int = 20,
                     group: str = DEFAULT_GROUP,
                     topic: str = DEFAULT_TOPIC) -> list[SearchResult]:
     """Search the YTDLNIS group via the authorized MTProto reader."""
-    if not TG_PYTHON.exists():
+    tg_python, tg_dir = telegram_reader_paths()
+    if not tg_python.exists():
         return [SearchResult("telegram", "telegram-reader not found",
-                             f"Expected at {TG_PYTHON}")]
-    script = TG_DIR / "search.py"
-    cmd = [str(TG_PYTHON), str(script), group, query, str(limit)]
+                             "Install the optional Telegram search helper to enable this source.")]
+    script = tg_dir / "search.py"
+    cmd = [str(tg_python), str(script), group, query, str(limit)]
     if topic:
         cmd.append(topic)
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=120, cwd=str(TG_DIR),
+            errors="replace", timeout=120, cwd=str(tg_dir),
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except Exception as exc:
@@ -140,14 +147,15 @@ def search_telegram(query: str, limit: int = 20,
 def read_recent_topic(limit: int = 40, group: str = DEFAULT_GROUP,
                       topic: str = DEFAULT_TOPIC) -> list[SearchResult]:
     """Read the newest messages of a group topic (context for the doctor)."""
-    if not TG_PYTHON.exists():
+    tg_python, tg_dir = telegram_reader_paths()
+    if not tg_python.exists():
         return []
-    script = TG_DIR / "read_topic.py"
+    script = tg_dir / "read_topic.py"
     try:
         proc = subprocess.run(
-            [str(TG_PYTHON), str(script), group, topic, str(limit)],
+            [str(tg_python), str(script), group, topic, str(limit)],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=120, cwd=str(TG_DIR),
+            errors="replace", timeout=120, cwd=str(tg_dir),
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except Exception:

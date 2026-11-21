@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget)
 
+from app_paths import DATA_DIR
 import downloader
 import error_doctor
 import knowledge
@@ -40,8 +41,7 @@ MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".mp3",
 from error_doctor import extract_signature
 from agent_launcher import detect_cli, launch_deep_search
 
-BASE_DIR = Path(__file__).resolve().parent
-SETTINGS_FILE = BASE_DIR / "settings.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
 
 DEFAULT_SETTINGS = {
     "output_dir": str(downloader.DEFAULT_OUTPUT),
@@ -72,7 +72,7 @@ SETTINGS = load_settings()
 
 
 # ----------------------------------------------------------- thumbnails ----
-THUMB_CACHE = BASE_DIR / "thumb_cache"
+THUMB_CACHE = DATA_DIR / "thumb_cache"
 
 
 def video_id_from_url(url: str) -> str:

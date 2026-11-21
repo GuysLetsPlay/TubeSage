@@ -1,5 +1,8 @@
 # binaries (auto-downloaded at first run)
 bin/
+build/
+dist/
+*.spec
 *.log
 *.py[cod]
 __pycache__/
