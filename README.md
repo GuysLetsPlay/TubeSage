@@ -9,8 +9,8 @@ OpenCode to research a fix.
 
 1. Open the [latest TubeSage release](https://github.com/GuysLetsPlay/TubeSage/releases/latest).
 2. Download **TubeSage-Setup.exe** and open it.
-3. Follow the installer steps. It installs just for your Windows account and
-   does not require Python or administrator access.
+3. Approve the Windows administrator prompt and follow the installer steps.
+   TubeSage installs under Program Files and does not require Python.
 4. Open TubeSage from the Start menu or the optional desktop shortcut.
 
 On first run, TubeSage downloads yt-dlp automatically. To merge high-quality
