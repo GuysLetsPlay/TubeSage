@@ -26,6 +26,11 @@ only download it from this repository's Releases page.
 - Download queue with progress, speed, ETA, cancel, retry, and history
 - Resume failed downloads, watch supported videos while they download, and
   browse queue/history as thumbnail cards
+- Twitch archive mode: select a streamer and start date, or a fixed date range;
+  TubeSage refreshes the archive automatically and downloads VODs in six-hour
+  files during your chosen time window until the storage allowance is reached
+- Open each VOD's folder and YouTube Studio to upload the files manually, then
+  mark that VOD done or delete its local files
 - Error Doctor with yt-dlp GitHub issue search, optional YTDLNIS Telegram
   reader, and deep research through an installed Codex, Cline, or OpenCode CLI
 
@@ -33,6 +38,12 @@ The optional Telegram search requires a separately installed reader. Set the
 `TUBESAGE_TELEGRAM_READER` environment variable to its folder; TubeSage never
 posts to Telegram. The AI CLI feature likewise requires the selected CLI to be
 installed and logged in. Downloads work without either integration.
+
+Twitch archive mode uses yt-dlp and ffmpeg and is configured in **Settings**.
+It downloads public Twitch archive VODs; the Twitch channel must retain its
+VODs for yt-dlp to access them. YouTube upload is manual: TubeSage opens the
+archive folder and YouTube Studio, where you can upload the six-hour files.
+The app does not sign in to YouTube or upload on your behalf.
 
 ## Data and privacy
 

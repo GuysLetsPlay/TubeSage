@@ -16,7 +16,7 @@ import webbrowser
 from pathlib import Path
 
 from PySide6.QtCore import (QByteArray, QObject, QPoint, QSize, Qt, QThread,
-                            QTimer, QUrl, Signal)
+                            QTimer, QUrl, Signal, QDate)
 from PySide6.QtGui import (QColor, QFont, QIcon, QPainter, QPen, QPixmap,
                            QPolygon)
 from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkReply,
@@ -26,14 +26,18 @@ from PySide6.QtWidgets import (
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget)
+    QVBoxLayout, QWidget, QDateEdit, QTableWidget, QTableWidgetItem,
+    QHeaderView, QDoubleSpinBox, QTimeEdit)
+from PySide6.QtWidgets import QScrollArea
 
 from app_paths import DATA_DIR
 import downloader
 import error_doctor
 import knowledge
 import ytdlp_manager as mgr
+import twitch_archive
 from downloader import DownloadWorker, Job, MetaWorker
+from twitch_archive import ArchiveDownloadWorker, VodSearchWorker
 
 # file types the "watch now" folder-scan considers playable
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".mp3",
@@ -415,6 +419,14 @@ class MainWindow(QMainWindow):
         self.thumbs = ThumbCache(self)
         self.bootstrap: BootstrapWorker | None = None
         self.meta_worker: MetaWorker | None = None
+        self.archive_search: VodSearchWorker | None = None
+        self.archive_worker: ArchiveDownloadWorker | None = None
+        self.archive_timer = QTimer(self)
+        self.archive_timer.setInterval(30_000)
+        self.archive_timer.timeout.connect(self._archive_tick)
+        self.archive_scan_timer = QTimer(self)
+        self.archive_scan_timer.setInterval(60 * 60 * 1000)
+        self.archive_scan_timer.timeout.connect(self._archive_search)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -422,6 +434,13 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_queue_tab(), "📥 Queue")
         self.tabs.addTab(self._build_history_tab(), "🕘 History")
         self.tabs.addTab(self._build_settings_tab(), "⚙ Settings")
+        self._restore_archive_controls()
+        self._refresh_archive_table()
+        self.archive_timer.start()
+        if SETTINGS.get("twitch_archive", {}).get("auto_refresh", True):
+            self.archive_scan_timer.start()
+            if SETTINGS.get("twitch_archive", {}).get("streamer"):
+                QTimer.singleShot(1500, self._archive_search)
 
         self.statusBar().showMessage("Ready.")
         if not mgr.ytdlp_available():
@@ -975,7 +994,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------ settings ----
     def _build_settings_tab(self) -> QWidget:
         w = QWidget()
-        lay = QVBoxLayout(w)
+        outer = QVBoxLayout(w)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
 
         eng = QGroupBox("Download engine")
         el = QVBoxLayout(eng)
@@ -993,6 +1018,103 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         el.addLayout(row)
         lay.addWidget(eng)
+
+        archive = QGroupBox("Twitch VOD archive → YouTube Studio")
+        al = QVBoxLayout(archive)
+        archive_form = QFormLayout()
+        self.archive_streamer = QLineEdit()
+        self.archive_streamer.setPlaceholderText("Twitch channel login, for example trimax")
+        archive_form.addRow("Twitch streamer:", self.archive_streamer)
+
+        self.archive_start = QDateEdit(QDate.currentDate())
+        self.archive_start.setCalendarPopup(True)
+        self.archive_start.setDisplayFormat("yyyy-MM-dd")
+        archive_form.addRow("Start date (inclusive):", self.archive_start)
+
+        end_row = QHBoxLayout()
+        self.archive_range_enabled = QCheckBox("Use an end date")
+        self.archive_end = QDateEdit(QDate.currentDate())
+        self.archive_end.setCalendarPopup(True)
+        self.archive_end.setDisplayFormat("yyyy-MM-dd")
+        self.archive_end.setEnabled(False)
+        self.archive_range_enabled.toggled.connect(self.archive_end.setEnabled)
+        end_row.addWidget(self.archive_range_enabled)
+        end_row.addWidget(self.archive_end)
+        archive_form.addRow("Date range:", end_row)
+
+        folder_row = QHBoxLayout()
+        self.archive_folder = QLineEdit(str(downloader.DEFAULT_OUTPUT / "Twitch Archive"))
+        self.archive_folder.setReadOnly(True)
+        choose_folder = QPushButton("Browse…")
+        choose_folder.clicked.connect(self._choose_archive_folder)
+        folder_row.addWidget(self.archive_folder, 1)
+        folder_row.addWidget(choose_folder)
+        archive_form.addRow("Archive folder:", folder_row)
+
+        window_row = QHBoxLayout()
+        self.archive_start_time = QTimeEdit()
+        self.archive_start_time.setDisplayFormat("HH:mm")
+        self.archive_end_time = QTimeEdit()
+        self.archive_end_time.setDisplayFormat("HH:mm")
+        self.archive_start_time.setTime(self.archive_start_time.time().fromString("06:00", "HH:mm"))
+        self.archive_end_time.setTime(self.archive_end_time.time().fromString("23:00", "HH:mm"))
+        window_row.addWidget(QLabel("From"))
+        window_row.addWidget(self.archive_start_time)
+        window_row.addWidget(QLabel("to"))
+        window_row.addWidget(self.archive_end_time)
+        archive_form.addRow("Download window:", window_row)
+
+        self.archive_limit = QDoubleSpinBox()
+        self.archive_limit.setRange(1, 100000)
+        self.archive_limit.setDecimals(0)
+        self.archive_limit.setSuffix(" GB")
+        self.archive_limit.setValue(500)
+        archive_form.addRow("Storage allowance:", self.archive_limit)
+        self.archive_auto_refresh = QCheckBox("Automatically refresh this Twitch archive every hour")
+        self.archive_auto_refresh.setChecked(True)
+        archive_form.addRow("Automatic search:", self.archive_auto_refresh)
+        al.addLayout(archive_form)
+
+        archive_help = QLabel(
+            "TubeSage finds public Twitch archive VODs and downloads them in six-hour files. "
+            "A start date with no end date keeps searching forward. Set an end date for a fixed range. "
+            "Downloaded files stay here until you upload them manually in YouTube Studio and mark the VOD done. "
+            "Install ffmpeg in the Download engine section for segmented downloads.")
+        archive_help.setWordWrap(True)
+        al.addWidget(archive_help)
+        archive_actions = QHBoxLayout()
+        find_vods = QPushButton("Find VODs now")
+        find_vods.clicked.connect(self._archive_search)
+        open_studio = QPushButton("Open YouTube Studio")
+        open_studio.clicked.connect(lambda: webbrowser.open("https://studio.youtube.com/"))
+        archive_actions.addWidget(find_vods)
+        archive_actions.addWidget(open_studio)
+        archive_actions.addStretch(1)
+        al.addLayout(archive_actions)
+        self.archive_status = QLabel("No Twitch archive search yet.")
+        self.archive_status.setWordWrap(True)
+        al.addWidget(self.archive_status)
+        self.archive_table = QTableWidget(0, 4)
+        self.archive_table.setHorizontalHeaderLabels(["VOD", "Stream date", "Status", "Details"])
+        self.archive_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.archive_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.archive_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.archive_table.verticalHeader().setVisible(False)
+        self.archive_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.archive_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.archive_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.archive_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        al.addWidget(self.archive_table, 1)
+        archive_buttons = QHBoxLayout()
+        for title, callback in (("Open VOD folder", self._archive_open_folder),
+                                ("Mark uploaded / done", self._archive_mark_done),
+                                ("Retry failed", self._archive_retry_failed),
+                                ("Delete local files", self._archive_delete_files)):
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            archive_buttons.addWidget(button)
+        al.addLayout(archive_buttons)
+        lay.addWidget(archive, 1)
 
         doc = QGroupBox("Error Doctor")
         dl = QFormLayout(doc)
@@ -1030,8 +1152,241 @@ class MainWindow(QMainWindow):
         SETTINGS["cookies_file"] = self.cookies_edit.text().strip()
         SETTINGS["extra_args"] = self.extra_edit.text().strip()
         SETTINGS["preset"] = self.preset_combo.currentText()
+        self._save_archive_settings()
         save_settings(SETTINGS)
+        if self.archive_auto_refresh.isChecked():
+            self.archive_scan_timer.start()
+        else:
+            self.archive_scan_timer.stop()
         self.statusBar().showMessage("Settings saved.", 4000)
+
+    # ------------------------------------------------ Twitch archive ----
+    def _archive_defaults(self) -> dict:
+        return {
+            "streamer": "", "start_date": QDate.currentDate().toString("yyyy-MM-dd"), "end_date": "",
+            "output_dir": str(downloader.DEFAULT_OUTPUT / "Twitch Archive"),
+            "start_time": "06:00", "end_time": "23:00", "max_gb": 500,
+            "auto_refresh": True, "vods": [],
+        }
+
+    def _archive_settings(self) -> dict:
+        state = self._archive_defaults()
+        state.update(SETTINGS.get("twitch_archive", {}))
+        return state
+
+    def _restore_archive_controls(self):
+        a = self._archive_settings()
+        for vod in a.get("vods", []):
+            if vod.get("status") == "downloading":
+                vod["status"] = "paused"
+                vod["error"] = "Paused when TubeSage closed; will resume automatically"
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self.archive_streamer.setText(a.get("streamer", ""))
+        self.archive_start.setDate(QDate.fromString(a.get("start_date", self._archive_defaults()["start_date"]), "yyyy-MM-dd"))
+        end = a.get("end_date", "")
+        if end:
+            self.archive_range_enabled.setChecked(True)
+            self.archive_end.setDate(QDate.fromString(end, "yyyy-MM-dd"))
+        self.archive_folder.setText(a.get("output_dir", self._archive_defaults()["output_dir"]))
+        self.archive_start_time.setTime(self.archive_start_time.time().fromString(a.get("start_time", "06:00"), "HH:mm"))
+        self.archive_end_time.setTime(self.archive_end_time.time().fromString(a.get("end_time", "23:00"), "HH:mm"))
+        self.archive_limit.setValue(float(a.get("max_gb", 500)))
+        self.archive_auto_refresh.setChecked(bool(a.get("auto_refresh", True)))
+
+    def _save_archive_settings(self):
+        a = self._archive_settings()
+        a.update({
+            "streamer": self.archive_streamer.text().strip().lstrip("@"),
+            "start_date": self.archive_start.date().toString("yyyy-MM-dd"),
+            "end_date": self.archive_end.date().toString("yyyy-MM-dd") if self.archive_range_enabled.isChecked() else "",
+            "output_dir": self.archive_folder.text().strip(),
+            "start_time": self.archive_start_time.time().toString("HH:mm"),
+            "end_time": self.archive_end_time.time().toString("HH:mm"),
+            "max_gb": self.archive_limit.value(),
+            "auto_refresh": self.archive_auto_refresh.isChecked(),
+        })
+        if hasattr(self, "archive_table"):
+            for vod in a.get("vods", []):
+                if vod.get("status") == "storage-full":
+                    vod["status"] = "queued"
+                    vod["error"] = ""
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+
+    def _choose_archive_folder(self):
+        selected = QFileDialog.getExistingDirectory(self, "Choose Twitch VOD folder",
+                                                    self.archive_folder.text())
+        if selected:
+            self.archive_folder.setText(selected)
+            self._save_archive_settings()
+
+    def _archive_search(self):
+        if self.archive_search and self.archive_search.isRunning():
+            return
+        self._save_archive_settings()
+        a = self._archive_settings()
+        if not a["streamer"]:
+            self.archive_status.setText("Enter a Twitch channel login first.")
+            return
+        self.archive_search = VodSearchWorker(a["streamer"], a["start_date"], a["end_date"], self)
+        self.archive_search.progress.connect(self.archive_status.setText)
+        self.archive_search.failed.connect(self._archive_search_failed)
+        self.archive_search.found.connect(self._archive_search_finished)
+        self.archive_search.start()
+
+    def _archive_search_failed(self, error: str):
+        self.archive_status.setText(f"Twitch search failed: {error}")
+
+    def _archive_search_finished(self, found: list):
+        a = self._archive_settings()
+        existing = {str(v.get("id")): v for v in a.get("vods", [])}
+        added = 0
+        for vod in found:
+            old = existing.get(str(vod["id"]))
+            if old:
+                vod.update(old)
+            else:
+                added += 1
+            existing[str(vod["id"])] = vod
+        a["vods"] = sorted(existing.values(), key=lambda v: (v.get("date", ""), v.get("id", "")))
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._refresh_archive_table()
+        self.archive_status.setText(f"Found {len(found)} VODs in this date selection; {added} new. Downloads continue in the allowed window.")
+
+    def _refresh_archive_table(self):
+        if not hasattr(self, "archive_table"):
+            return
+        vods = self._archive_settings().get("vods", [])
+        self.archive_table.setRowCount(len(vods))
+        for row, vod in enumerate(vods):
+            status = vod.get("status", "queued")
+            status_label = {
+                "downloaded": "✅ Downloaded",
+                "done": "✓ Done",
+                "downloading": "⬇ Downloading",
+                "paused": "⏸ Paused",
+                "error": "⚠ Error",
+                "storage-full": "⛔ Storage full",
+            }.get(status, "Queued")
+            details = vod.get("error", "")
+            if vod.get("status") == "downloaded":
+                details = "Ready to upload in YouTube Studio"
+            elif vod.get("status") == "done":
+                details = "Uploaded; retained until you delete the files"
+            for column, value in enumerate((vod.get("title", ""), vod.get("date", ""),
+                                             status_label, details)):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.UserRole, str(vod.get("id", "")))
+                self.archive_table.setItem(row, column, item)
+
+    def _selected_archive_vod(self):
+        row = self.archive_table.currentRow()
+        if row < 0:
+            return None
+        item = self.archive_table.item(row, 0)
+        if item is None:
+            return None
+        vod_id = item.data(Qt.UserRole)
+        return next((v for v in self._archive_settings().get("vods", [])
+                     if str(v.get("id")) == str(vod_id)), None)
+
+    def _archive_open_folder(self):
+        vod = self._selected_archive_vod()
+        if not vod:
+            return
+        folder = twitch_archive.vod_folder(self.archive_folder.text(), vod)
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(folder))
+
+    def _archive_mark_done(self):
+        vod = self._selected_archive_vod()
+        if not vod:
+            return
+        if vod.get("status") != "downloaded":
+            QMessageBox.information(self, "TubeSage", "Download all VOD segments, upload them manually in YouTube Studio, then mark this VOD done.")
+            return
+        vod["status"] = "done"
+        vod["error"] = ""
+        self._save_archive_settings()
+        self._refresh_archive_table()
+
+    def _archive_delete_files(self):
+        vod = self._selected_archive_vod()
+        if not vod:
+            return
+        folder = twitch_archive.vod_folder(self.archive_folder.text(), vod)
+        if not folder.exists():
+            return
+        confirm = QMessageBox.question(self, "Delete downloaded files?",
+                                       f"Permanently delete files in:\n{folder}")
+        if confirm != QMessageBox.Yes:
+            return
+        shutil.rmtree(folder, ignore_errors=True)
+        vod["segments_done"] = []
+        vod["status"] = "done" if vod.get("status") in ("downloaded", "done") else "queued"
+        vod["error"] = ""
+        self._save_archive_settings()
+        self._refresh_archive_table()
+
+    def _archive_retry_failed(self):
+        for vod in self._archive_settings().get("vods", []):
+            if vod.get("status") == "error":
+                vod["status"] = "queued"
+                vod["error"] = ""
+        self._save_archive_settings()
+        self._refresh_archive_table()
+
+    def _archive_tick(self):
+        if self.archive_worker and self.archive_worker.isRunning():
+            return
+        a = self._archive_settings()
+        pending = [dict(v) for v in a.get("vods", [])
+                   if v.get("status") in ("queued", "paused")]
+        if not pending:
+            return
+        self._save_archive_settings()
+        a = self._archive_settings()
+        self.archive_worker = ArchiveDownloadWorker(
+            pending, a["output_dir"], a["start_time"], a["end_time"],
+            float(a["max_gb"]), self)
+        self.archive_worker.progress.connect(self.archive_status.setText)
+        self.archive_worker.changed.connect(self._archive_state_changed)
+        self.archive_worker.segment_done.connect(self._archive_segment_done)
+        self.archive_worker.start()
+
+    def _archive_segment_done(self, vod_id: str, segment: int):
+        a = self._archive_settings()
+        for vod in a.get("vods", []):
+            if str(vod.get("id")) == str(vod_id):
+                done = set(vod.get("segments_done", []))
+                done.add(int(segment))
+                vod["segments_done"] = sorted(done)
+                break
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+
+    def _archive_state_changed(self, vod_id: str, state: str, detail: str):
+        a = self._archive_settings()
+        for vod in a.get("vods", []):
+            if str(vod.get("id")) == str(vod_id):
+                vod["status"] = state
+                vod["error"] = detail if state in ("error", "storage-full") else ""
+                break
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._refresh_archive_table()
+
+    def closeEvent(self, event):
+        if self.archive_worker and self.archive_worker.isRunning():
+            self.archive_worker.cancel()
+            self.archive_worker.wait(5000)
+        if self.archive_search and self.archive_search.isRunning():
+            self.archive_search.cancel()
+            self.archive_search.wait(5000)
+        self._save_archive_settings()
+        event.accept()
 
     # ------------------------------------------------------ bootstrap ----
     def _bootstrap(self, with_ffmpeg: bool):
