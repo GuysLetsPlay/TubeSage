@@ -1,0 +1,16 @@
+# binaries (auto-downloaded at first run)
+bin/
+*.log
+*.py[cod]
+__pycache__/
+.venv/
+venv/
+
+# local data
+settings.json
+thumb_cache/
+AGENTS.md
+knowledge/
+knowledge/solutions.json
+knowledge/pending/
+knowledge/processed/

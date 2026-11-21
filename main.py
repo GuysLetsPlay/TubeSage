@@ -1,0 +1,1087 @@
+"""TubeSage — a friendly Windows GUI for yt-dlp, oriented at YTDLnis.
+
+Tabs: Download | Queue | History | Settings
+Error Doctor: hybrid error helper (auto Telegram+GitHub search, optional
+deep search via a visible CLI agent, feedback-based knowledge base).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import webbrowser
+from pathlib import Path
+
+from PySide6.QtCore import (QByteArray, QObject, QPoint, QSize, Qt, QThread,
+                            QTimer, QUrl, Signal)
+from PySide6.QtGui import (QColor, QFont, QIcon, QPainter, QPen, QPixmap,
+                           QPolygon)
+from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkReply,
+                               QNetworkRequest)
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+    QPushButton, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget)
+
+import downloader
+import error_doctor
+import knowledge
+import ytdlp_manager as mgr
+from downloader import DownloadWorker, Job, MetaWorker
+
+# file types the "watch now" folder-scan considers playable
+MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".mp3",
+              ".m4a", ".opus", ".ogg", ".wav", ".flac"}
+from error_doctor import extract_signature
+from agent_launcher import detect_cli, launch_deep_search
+
+BASE_DIR = Path(__file__).resolve().parent
+SETTINGS_FILE = BASE_DIR / "settings.json"
+
+DEFAULT_SETTINGS = {
+    "output_dir": str(downloader.DEFAULT_OUTPUT),
+    "cli_agent": "auto",
+    "tg_group": error_doctor.DEFAULT_GROUP,
+    "tg_topic": error_doctor.DEFAULT_TOPIC,
+    "preset": "Best quality",
+    "history": [],          # [{title, filepath, when}]
+}
+
+
+def load_settings() -> dict:
+    s = dict(DEFAULT_SETTINGS)
+    if SETTINGS_FILE.exists():
+        try:
+            s.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return s
+
+
+def save_settings(s: dict) -> None:
+    SETTINGS_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+
+
+SETTINGS = load_settings()
+
+
+# ----------------------------------------------------------- thumbnails ----
+THUMB_CACHE = BASE_DIR / "thumb_cache"
+
+
+def video_id_from_url(url: str) -> str:
+    """Extract the video id from a YouTube-ish URL ('[id]' naming source)."""
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([\w-]{6,})", url or "")
+    return m.group(1) if m else ""
+
+
+def video_id_from_path(path: str) -> str:
+    """Extract the video id yt-dlp appended as '[id]' to a filename."""
+    m = re.search(r"\[([\w-]{6,})\]", Path(path or "").name)
+    return m.group(1) if m else ""
+
+
+def placeholder_pixmap(w: int = 320, h: int = 180) -> QPixmap:
+    """Dark frame with a play triangle — shown until a thumbnail loads."""
+    pm = QPixmap(w, h)
+    pm.fill(QColor("#1e1e1e"))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(QColor("#3a3a3a"), 2))
+    p.drawRoundedRect(4, 4, w - 8, h - 8, 10, 10)
+    s = h // 4
+    x, y = w // 2 - s // 2, h // 2 - s // 2
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#5a5a5a"))
+    p.drawPolygon(QPolygon([QPoint(x, y), QPoint(x, y + s),
+                            QPoint(x + s, y + s // 2)]))
+    p.end()
+    return pm
+
+
+class ThumbCache(QObject):
+    """Video thumbnails for the grid views.
+
+    Loads https://i.ytimg.com/vi/<id>/mqdefault.jpg asynchronously via
+    QtNetwork, with an in-memory dict and an on-disk cache folder so
+    previously seen videos render instantly and offline.
+    Non-YouTube ids (or offline machines) get a placeholder pixmap.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.mem: dict[str, QPixmap] = {}
+        self._ph: QPixmap | None = None
+        self.nam = QNetworkAccessManager(self)
+        try:
+            THUMB_CACHE.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    def placeholder(self) -> QPixmap:
+        if self._ph is None:
+            self._ph = placeholder_pixmap()
+        return self._ph
+
+    def get(self, vid: str, cb) -> None:
+        """Call cb(QPixmap) with the thumbnail for vid (async for fetches)."""
+        if not vid:
+            cb(self.placeholder())
+            return
+        pm = self.mem.get(vid)
+        if pm is not None:
+            cb(pm)
+            return
+        f = THUMB_CACHE / f"{vid}.jpg"
+        if f.exists():
+            pm = QPixmap(str(f))
+            if not pm.isNull():
+                self.mem[vid] = pm
+                cb(pm)
+                return
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        reply = self.nam.get(QNetworkRequest(
+            QUrl(f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")))
+        reply.finished.connect(lambda _=False, r=reply: self._done(r, vid, cb))
+
+    def _done(self, reply: QNetworkReply, vid: str, cb) -> None:
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
+        data = bytes(reply.readAll())
+        reply.deleteLater()
+        pm = QPixmap()
+        if ok and data:
+            pm.loadFromData(data)
+        if not pm.isNull():
+            try:
+                (THUMB_CACHE / f"{vid}.jpg").write_bytes(data)
+            except OSError:
+                pass
+        else:
+            pm = self.placeholder()
+        self.mem[vid] = pm
+        cb(pm)
+
+
+# ------------------------------------------------------------ bootstrap ----
+class BootstrapWorker(QThread):
+    """First-run: download yt-dlp.exe (and optionally ffmpeg)."""
+    step = Signal(str)
+    done = Signal(bool, str)
+
+    def __init__(self, with_ffmpeg: bool = False, parent=None):
+        super().__init__(parent)
+        self.with_ffmpeg = with_ffmpeg
+
+    def run(self):
+        try:
+            self.step.emit("Downloading yt-dlp.exe …")
+            mgr.install_ytdlp()
+            self.step.emit(f"yt-dlp ready ({mgr.ytdlp_version()})")
+            if self.with_ffmpeg:
+                self.step.emit("Downloading ffmpeg (≈90 MB) …")
+                mgr.install_ffmpeg()
+                self.step.emit("ffmpeg ready")
+            self.done.emit(True, "Setup complete.")
+        except Exception as exc:
+            self.done.emit(False, f"Setup failed: {exc}")
+
+
+class AutoSearchWorker(QThread):
+    """Runs the Telegram+GitHub auto search off the UI thread."""
+    progress = Signal(str)
+    finished_search = Signal(object)   # error_doctor.DoctorReport
+
+    def __init__(self, error_text: str, group: str, topic: str, parent=None):
+        super().__init__(parent)
+        self.error_text = error_text
+        self.group = group
+        self.topic = topic
+
+    def run(self):
+        try:
+            error_doctor.DEFAULT_GROUP = self.group
+            error_doctor.DEFAULT_TOPIC = self.topic
+            report = error_doctor.run_auto_search(
+                self.error_text,
+                progress_cb=lambda msg: self.progress.emit(msg))
+        except Exception as exc:
+            report = error_doctor.DoctorReport(
+                error_text=self.error_text,
+                signature=extract_signature(self.error_text),
+                results=[error_doctor.SearchResult(
+                    "github", "Search crashed", str(exc))])
+        self.finished_search.emit(report)
+
+
+
+# ------------------------------------------------------- error doctor ----
+class ErrorDoctorDialog(QDialog):
+    """Hybrid error helper: KB -> auto search -> CLI agent -> feedback."""
+
+    def __init__(self, error_text: str, yt_command: str, parent=None):
+        super().__init__(parent)
+        self.error_text = error_text
+        self.yt_command = yt_command
+        self.signature = extract_signature(error_text)
+        self.report: error_doctor.DoctorReport | None = None
+        self.worker: AutoSearchWorker | None = None
+        self.current_entry: dict | None = None
+
+        self.setWindowTitle("TubeSage Error Doctor")
+        self.resize(860, 640)
+        lay = QVBoxLayout(self)
+
+        head = QLabel("🩺 Error Doctor — find out what went wrong and how to fix it")
+        head.setStyleSheet("font-size: 16px; font-weight: bold;")
+        lay.addWidget(head)
+
+        err_box = QPlainTextEdit()
+        err_box.setPlainText(error_text[-2500:])
+        err_box.setReadOnly(True)
+        err_box.setMaximumHeight(110)
+        err_box.setFont(QFont("Consolas", 9))
+        lay.addWidget(QLabel("Error output:"))
+        lay.addWidget(err_box)
+
+        # KB matches
+        self.kb_list = QListWidget()
+        self.kb_list.setMaximumHeight(150)
+        lay.addWidget(QLabel("Known solutions (community-confirmed first):"))
+        lay.addWidget(self.kb_list)
+        self.kb_list.itemDoubleClicked.connect(self._show_kb_solution)
+
+        # search results
+        self.results_list = QListWidget()
+        self.results_list.itemDoubleClicked.connect(self._open_result)
+        lay.addWidget(QLabel("Telegram (YTDLNIS group) + yt-dlp GitHub results — double-click to open:"))
+        lay.addWidget(self.results_list)
+
+        self.status = QLabel("Ready.")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        btns = QHBoxLayout()
+        self.btn_search = QPushButton("🔍 Find a fix (Telegram + GitHub)")
+        self.btn_search.clicked.connect(self.run_auto_search)
+        self.btn_deep = QPushButton("🤖 Deep Search (opens AI CLI)")
+        self.btn_deep.clicked.connect(self.deep_search)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.reject)
+        btns.addWidget(self.btn_search)
+        btns.addWidget(self.btn_deep)
+        btns.addStretch(1)
+        btns.addWidget(btn_close)
+        lay.addLayout(btns)
+
+        # feedback buttons for the currently shown solution
+        fb_row = QHBoxLayout()
+        self.btn_worked = QPushButton("✅ This fixed it")
+        self.btn_failed = QPushButton("❌ Didn't help")
+        self.btn_worked.clicked.connect(lambda: self._feedback(True))
+        self.btn_failed.clicked.connect(lambda: self._feedback(False))
+        fb_row.addWidget(self.btn_worked)
+        fb_row.addWidget(self.btn_failed)
+        fb_row.addStretch(1)
+        lay.addLayout(fb_row)
+
+        # poll for solutions written by the CLI agent
+        self.poll = QTimer(self)
+        self.poll.timeout.connect(self._import_pending)
+        self.poll.start(3000)
+
+        self._load_kb()
+        self.run_auto_search()   # hybrid: auto search always runs first
+
+
+    # ---------------------------------------------------------- KB -----
+    def _load_kb(self):
+        self.kb_list.clear()
+        matches = knowledge.find_matches(self.error_text, self.signature)
+        self.current_entry = None
+        if not matches:
+            QListWidgetItem("No known solution for this error yet.", self.kb_list)
+            return
+        for m in matches[:5]:
+            badge = {"confirmed": "✅ confirmed", "rejected": "❌ rejected",
+                     "new": "new"}.get(m["status"], m["status"])
+            QListWidgetItem(
+                f"[{badge}] (match {int(m['score']*100)}%, worked {m['worked']}×) "
+                f"{m['signature'][:90]}  —  double-click to view",
+                self.kb_list)
+        self.current_entry = matches[0]
+        self._show_kb_solution(self.kb_list.item(0))
+
+    def _show_kb_solution(self, item):
+        matches = knowledge.find_matches(self.error_text, self.signature)
+        if not matches:
+            return
+        idx = self.kb_list.row(item)
+        if 0 <= idx < len(matches):
+            self.current_entry = matches[idx]
+            self.status.setText(
+                f"💡 Solution (source: {matches[idx]['source']}):\n\n"
+                + matches[idx]["solution_md"][:2000])
+
+    def _feedback(self, worked: bool):
+        if not self.current_entry:
+            QMessageBox.information(self, "Error Doctor",
+                                    "No solution to rate yet.")
+            return
+        if worked:
+            knowledge.mark_worked(self.current_entry["id"])
+            self.status.setText("🎉 Great! Saved as a confirmed fix — it will "
+                                "be offered first next time.")
+        else:
+            knowledge.mark_failed(self.current_entry["id"])
+            self.status.setText("Noted. Try the Deep Search for a thorough "
+                                "step-by-step investigation.")
+
+    # -------------------------------------------------- auto search -----
+    def run_auto_search(self):
+        self.btn_search.setEnabled(False)
+        self.results_list.clear()
+        self.status.setText("Searching YTDLNIS Telegram group and yt-dlp GitHub issues …")
+        self.worker = AutoSearchWorker(self.error_text,
+                                       SETTINGS.get("tg_group", "YTDLNIS"),
+                                       SETTINGS.get("tg_topic", "general"))
+        self.worker.progress.connect(self.status.setText)
+        self.worker.finished_search.connect(self._search_done)
+        self.worker.start()
+
+    def _search_done(self, report):
+        self.report = report
+        self.btn_search.setEnabled(True)
+        self.results_list.clear()
+        if report.queries:
+            QListWidgetItem(f"Search queries used: {' | '.join(report.queries)}",
+                            self.results_list)
+        for r in report.results[:40]:
+            icon = "💬" if r.source == "telegram" else "🐙"
+            item = QListWidgetItem(f"{icon} {r.title}\n    {r.body[:180]}")
+            item.setData(Qt.UserRole, r.url)
+            self.results_list.addItem(item)
+        self.status.setText(
+            "Double-click a result to open it, or use Deep Search for a "
+            "guided, thorough answer. If the AI agent writes a fix, it "
+            "appears in 'Known solutions' automatically.")
+
+    def _open_result(self, item):
+        url = item.data(Qt.UserRole)
+        if url:
+            webbrowser.open(url)
+
+    # -------------------------------------------------- deep search -----
+    def deep_search(self):
+        ok, msg = launch_deep_search(
+            self.error_text, self.yt_command, self.signature,
+            SETTINGS.get("cli_agent", "auto"))
+        if ok:
+            self.status.setText("🤖 " + msg)
+        else:
+            QMessageBox.warning(self, "Deep Search", msg)
+
+    def _import_pending(self):
+        try:
+            imported = knowledge.import_pending()
+        except Exception:
+            return
+        if imported:
+            self._load_kb()
+            self.status.setText("🤖 The AI agent finished and its solution was "
+                                "imported — see 'Known solutions' above. Try the "
+                                "fix, then rate it with ✅/❌.")
+
+
+
+# ---------------------------------------------------------- main window ----
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("TubeSage — download anything with yt-dlp")
+        self.resize(900, 620)
+        self.jobs: dict[str, Job] = {}
+        self.workers: dict[str, DownloadWorker] = {}
+        self.rows: dict[str, QTreeWidgetItem] = {}
+        self.grid_items: dict[str, QListWidgetItem] = {}
+        self.thumbs = ThumbCache(self)
+        self.bootstrap: BootstrapWorker | None = None
+        self.meta_worker: MetaWorker | None = None
+
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        self.tabs.addTab(self._build_download_tab(), "⬇ Download")
+        self.tabs.addTab(self._build_queue_tab(), "📥 Queue")
+        self.tabs.addTab(self._build_history_tab(), "🕘 History")
+        self.tabs.addTab(self._build_settings_tab(), "⚙ Settings")
+
+        self.statusBar().showMessage("Ready.")
+        if not mgr.ytdlp_available():
+            self._bootstrap(False)
+        elif not mgr.ffmpeg_available():
+            self.statusBar().showMessage(
+                "Tip: install ffmpeg (Settings) for merging high-quality video+audio.")
+
+    # ------------------------------------------------------ download ----
+    def _build_download_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        url_row = QHBoxLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("Paste a video / playlist / audio URL here …")
+        btn_fetch = QPushButton("Preview")
+        btn_fetch.clicked.connect(self.fetch_meta)
+        btn_paste = QPushButton("Paste")
+        btn_paste.clicked.connect(lambda: self.url_edit.paste())
+        url_row.addWidget(self.url_edit, 1)
+        url_row.addWidget(btn_paste)
+        url_row.addWidget(btn_fetch)
+        lay.addLayout(url_row)
+
+        self.meta_label = QLabel("")
+        self.meta_label.setWordWrap(True)
+        lay.addWidget(self.meta_label)
+
+        form = QFormLayout()
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([p[0] for p in downloader.PRESETS])
+        self.preset_combo.setCurrentText(SETTINGS.get("preset", "Best quality"))
+        form.addRow("Quality / format:", self.preset_combo)
+
+        self.out_edit = QLineEdit(SETTINGS.get("output_dir", ""))
+        btn_out = QPushButton("…")
+        btn_out.clicked.connect(self._pick_out)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.out_edit, 1)
+        out_row.addWidget(btn_out)
+        form.addRow("Save to:", out_row)
+
+        self.cookies_edit = QLineEdit(SETTINGS.get("cookies_file", ""))
+        self.cookies_edit.setPlaceholderText("optional — cookies.txt for age-restricted / bot-checked videos")
+        btn_ck = QPushButton("…")
+        btn_ck.clicked.connect(self._pick_cookies)
+        ck_row = QHBoxLayout()
+        ck_row.addWidget(self.cookies_edit, 1)
+        ck_row.addWidget(btn_ck)
+        form.addRow("Cookies:", ck_row)
+
+        self.extra_edit = QLineEdit(SETTINGS.get("extra_args", ""))
+        self.extra_edit.setPlaceholderText("extra yt-dlp arguments (advanced), e.g. --proxy http://…")
+        form.addRow("Extra args:", self.extra_edit)
+        lay.addLayout(form)
+
+        checks = QHBoxLayout()
+        self.chk_playlist = QCheckBox("Whole playlist")
+        self.chk_subs = QCheckBox("Subtitles")
+        self.chk_thumb = QCheckBox("Thumbnail"); self.chk_thumb.setChecked(True)
+        self.chk_meta = QCheckBox("Metadata"); self.chk_meta.setChecked(True)
+        self.chk_sb = QCheckBox("Skip sponsors (SponsorBlock)")
+        for c in (self.chk_playlist, self.chk_subs, self.chk_thumb,
+                  self.chk_meta, self.chk_sb):
+            checks.addWidget(c)
+        lay.addLayout(checks)
+
+        # dream features
+        dream = QHBoxLayout()
+        self.chk_watch = QCheckBox("👀 Watch while downloading")
+        self.chk_watch.setChecked(bool(SETTINGS.get("watch_while", False)))
+        self.chk_watch.setToolTip(
+            "Start watching the video while it is still downloading.\n"
+            "Uses single-file (progressive) formats when available so the file\n"
+            "grows as you watch. Best with VLC/mpv; the download continues in\n"
+            "the background no matter what.")
+        self.chk_resume = QCheckBox("🔁 Continue failed downloads (reuse partial files)")
+        self.chk_resume.setChecked(bool(SETTINGS.get("resume", False)))
+        self.chk_resume.setToolTip(
+            "If a download errors out, Retry reuses what was already on disk\n"
+            "instead of starting over. Also grabs livestreams from the start\n"
+            "(--live-from-start). Same folder + same quality = resume.")
+        dream.addWidget(self.chk_watch)
+        dream.addWidget(self.chk_resume)
+        dream.addStretch(1)
+        lay.addLayout(dream)
+
+        dl_row = QHBoxLayout()
+        btn_dl = QPushButton("⬇ Download")
+        btn_dl.setStyleSheet("font-weight: bold; padding: 8px 24px;")
+        btn_dl.clicked.connect(self.start_download)
+        btn_doc = QPushButton("🩺 Error Doctor…")
+        btn_doc.clicked.connect(lambda: self.open_doctor("", ""))
+        dl_row.addWidget(btn_dl)
+        dl_row.addWidget(btn_doc)
+        dl_row.addStretch(1)
+        lay.addLayout(dl_row)
+        lay.addStretch(1)
+        return w
+
+
+    def _pick_out(self):
+        d = QFileDialog.getExistingDirectory(self, "Choose output folder",
+                                             self.out_edit.text())
+        if d:
+            self.out_edit.setText(d)
+
+    def _pick_cookies(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Choose cookies.txt",
+                                           "", "cookies.txt (*.txt);;All files (*)")
+        if f:
+            self.cookies_edit.setText(f)
+
+    def fetch_meta(self):
+        url = self.url_edit.text().strip()
+        if not url:
+            return
+        self.meta_label.setText("Fetching info …")
+        self.meta_worker = MetaWorker(url)
+        self.meta_worker.got_meta.connect(self._meta_ok)
+        self.meta_worker.meta_error.connect(self._meta_fail)
+        self.meta_worker.start()
+
+    def _meta_ok(self, info: dict):
+        dur = info.get("duration") or 0
+        m, s = divmod(int(dur), 60)
+        self.meta_label.setText(
+            f"🎬 {info.get('title', '?')}   ·   {info.get('uploader', '?')}"
+            + (f"   ·   {m}:{s:02d}" if dur else ""))
+
+    def _meta_fail(self, err: str):
+        self.meta_label.setText("⚠ Could not fetch info — see Error Doctor.")
+        self.open_doctor(err, "")
+
+    def start_download(self):
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.information(self, "TubeSage", "Paste a URL first.")
+            return
+        job = Job(
+            url=url,
+            preset=self.preset_combo.currentText(),
+            output_dir=self.out_edit.text().strip() or str(downloader.DEFAULT_OUTPUT),
+            playlist=self.chk_playlist.isChecked(),
+            subtitles=self.chk_subs.isChecked(),
+            embed_thumbnail=self.chk_thumb.isChecked(),
+            embed_metadata=self.chk_meta.isChecked(),
+            sponsorblock=self.chk_sb.isChecked(),
+            cookies_file=self.cookies_edit.text().strip(),
+            extra_args=self.extra_edit.text().strip(),
+            watch_while=self.chk_watch.isChecked(),
+            resume=self.chk_resume.isChecked(),
+            title=url,
+        )
+        SETTINGS["watch_while"] = job.watch_while
+        SETTINGS["resume"] = job.resume
+        save_settings(SETTINGS)
+        self._enqueue(job)
+        self.tabs.setCurrentIndex(1)   # show queue
+
+
+    # --------------------------------------------------------- queue ----
+    def _build_queue_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.queue_stack = QStackedWidget()
+        self.queue_tree = QTreeWidget()
+        self.queue_tree.setHeaderLabels(
+            ["Video", "Progress", "Speed", "ETA", "Status"])
+        self.queue_tree.setRootIsDecorated(False)
+        self.queue_tree.setColumnWidth(0, 340)
+        self.queue_tree.itemDoubleClicked.connect(self._queue_double)
+        self.queue_grid = QListWidget()
+        self.queue_grid.setViewMode(QListWidget.IconMode)
+        self.queue_grid.setIconSize(QSize(160, 90))
+        self.queue_grid.setGridSize(QSize(184, 190))
+        self.queue_grid.setResizeMode(QListWidget.Adjust)
+        self.queue_grid.setMovement(QListWidget.Static)
+        self.queue_grid.setWordWrap(True)
+        self.queue_grid.setTextElideMode(Qt.ElideNone)
+        self.queue_grid.itemDoubleClicked.connect(self._grid_double)
+        self.queue_stack.addWidget(self.queue_tree)     # index 0: list view
+        self.queue_stack.addWidget(self.queue_grid)     # index 1: thumbnails
+        lay.addWidget(self.queue_stack)
+        btns = QHBoxLayout()
+        for label, cb in (
+                ("❌ Cancel selected", self._cancel_selected),
+                ("🔁 Retry selected", self._retry_selected),
+                ("▶ Watch now", self._watch_selected),
+                ("🩺 Find a fix (error)", self._fix_selected),
+                ("📁 Open output folder", self._open_out_dir)):
+            b = QPushButton(label)
+            b.clicked.connect(cb)
+            btns.addWidget(b)
+        self.btn_queue_view = QPushButton()
+        self.btn_queue_view.clicked.connect(self._toggle_queue_view)
+        btns.addStretch(1)
+        btns.addWidget(self.btn_queue_view)
+        lay.addLayout(btns)
+        self._set_queue_view(SETTINGS.get("queue_view") == "thumbs")
+        return w
+
+    def _set_queue_view(self, thumbs: bool):
+        self.queue_stack.setCurrentIndex(1 if thumbs else 0)
+        self.btn_queue_view.setText("☰ List" if thumbs else "▦ Thumbnails")
+        self.btn_queue_view.setToolTip(
+            "Switch between the list view and YTDLnis-style thumbnail cards.")
+        SETTINGS["queue_view"] = "thumbs" if thumbs else "list"
+        save_settings(SETTINGS)
+
+    def _toggle_queue_view(self):
+        self._set_queue_view(self.queue_stack.currentIndex() == 0)
+
+    # -- thumbnail card helpers ------------------------------------------
+    def _grid_status(self, job: Job) -> str:
+        if job.state == "downloading":
+            return f"{job.pct:.0f} % · {job.speed or '…'} · ETA {job.eta or '?'}"
+        if job.state == "finished":
+            return "finished ✔"
+        if job.state == "error":
+            return "ERROR — double-click for the Error Doctor"
+        return job.state
+
+    def _grid_sync(self, jid: str):
+        """Keep a job's thumbnail card (title + status) up to date."""
+        job = self.jobs.get(jid)
+        item = self.grid_items.get(jid)
+        if not job or not item:
+            return
+        item.setText(f"{job.title or job.url}\n{self._grid_status(job)}")
+        item.setToolTip(f"{job.title}\n{job.url}\n→ {job.output_dir}")
+
+    def _load_grid_thumb(self, jid: str):
+        job = self.jobs.get(jid)
+        if not job:
+            return
+        vid = video_id_from_url(job.url)
+        self.thumbs.get(
+            vid, lambda pm, jid=jid: self._grid_icon(jid, pm))
+
+    def _grid_icon(self, jid: str, pm: QPixmap):
+        item = self.grid_items.get(jid)
+        if item is not None:
+            item.setIcon(QIcon(pm))
+
+    def _jid_by_grid(self, item: QListWidgetItem) -> str | None:
+        for jid, it in self.grid_items.items():
+            if it is item:
+                return jid
+        return None
+
+    def _grid_double(self, item: QListWidgetItem):
+        jid = self._jid_by_grid(item)
+        job = self.jobs.get(jid) if jid else None
+        if not job:
+            return
+        if job.state == "error":
+            self.open_doctor(job.error_text, job.command)
+        elif job.state in ("finished", "downloading"):
+            self._open_watch(job)
+
+    def _enqueue(self, job: Job):
+        self.jobs[job.id] = job
+        row = self.rows.get(job.id)
+        if row is None:
+            row = QTreeWidgetItem([job.title, "0 %", "", "", "queued"])
+            self.queue_tree.insertTopLevelItem(0, row)
+            self.rows[job.id] = row
+        else:                       # retried job: reuse its existing row
+            row.setText(1, "0 %")
+            row.setText(2, "")
+            row.setText(3, "")
+            row.setText(4, "queued")
+        gi = self.grid_items.get(job.id)
+        if gi is None:
+            gi = QListWidgetItem()
+            gi.setSizeHint(QSize(184, 190))
+            gi.setIcon(QIcon(self.thumbs.placeholder()))
+            self.queue_grid.insertItem(0, gi)
+            self.grid_items[job.id] = gi
+            self._load_grid_thumb(job.id)
+        self._grid_sync(job.id)
+        worker = DownloadWorker(job)
+        self.workers[job.id] = worker
+        worker.progress.connect(self._on_progress)
+        worker.state_changed.connect(self._on_state)
+        worker.failed.connect(self._on_failed)
+        worker.finished_ok.connect(self._on_finished)
+        worker.start()
+
+    def _on_progress(self, jid: str, pct: float, speed: str, eta: str):
+        row = self.rows.get(jid)
+        if row:
+            row.setText(1, f"{pct:.1f} %")
+            row.setText(2, speed)
+            row.setText(3, eta)
+        self._grid_sync(jid)
+        job = self.jobs.get(jid)
+        if job and job.watch_while and not job.watch_opened \
+                and pct >= 2.0 and job.part_file:
+            job.watch_opened = True
+            self._open_watch(job)
+
+    def _on_state(self, jid: str, state: str):
+        row = self.rows.get(jid)
+        job = self.jobs.get(jid)
+        if row:
+            if state == "downloading" and job and job.resume:
+                row.setText(4, "downloading ▶ (continuing)")
+            else:
+                row.setText(4, state)
+        if row and job and row.text(0) == job.url and job.title != job.url:
+            row.setText(0, job.title)
+        self._grid_sync(jid)
+
+    def _on_failed(self, jid: str, error_text: str):
+        row = self.rows.get(jid)
+        if row:
+            row.setText(4, "ERROR — double-click for the Error Doctor")
+        self._grid_sync(jid)
+        job = self.jobs.get(jid)
+        if job:
+            self.open_doctor(error_text, job.command)
+
+    def _on_finished(self, jid: str, filepath: str):
+        row = self.rows.get(jid)
+        if row:
+            row.setText(4, "finished ✔")
+        self._grid_sync(jid)
+        job = self.jobs.get(jid)
+        if job:
+            # yt-dlp sometimes reports the pre-merge stream path (which is
+            # deleted right after) — resolve to the real final file
+            if not filepath or not os.path.exists(filepath):
+                filepath = self._resolve_media(job)
+            if filepath and os.path.exists(filepath):
+                job.filepath = filepath
+                import time as _t
+                SETTINGS.setdefault("history", []).insert(0, {
+                    "title": job.title, "filepath": filepath,
+                    "url": job.url,
+                    "when": _t.strftime("%Y-%m-%d %H:%M")})
+                save_settings(SETTINGS)
+                self._refresh_history()
+
+    def _selected_jid(self) -> str | None:
+        item = self.queue_tree.currentItem()
+        for jid, row in self.rows.items():
+            if row is item:
+                return jid
+        return None
+
+    def _queue_double(self, item, _col):
+        for jid, row in self.rows.items():
+            if row is item and self.jobs[jid].state == "error":
+                job = self.jobs[jid]
+                self.open_doctor(job.error_text, job.command)
+                return
+
+    def _cancel_selected(self):
+        jid = self._selected_jid()
+        if jid and self.workers[jid].job.state == "downloading":
+            self.workers[jid].cancel()
+
+    def _retry_selected(self):
+        jid = self._selected_jid()
+        job = self.jobs.get(jid) if jid else None
+        if job and job.state in ("error", "cancelled"):
+            # re-apply the current home-screen options (keep output_dir —
+            # resume only works if partial files stay in the same folder)
+            job.preset = self.preset_combo.currentText()
+            job.watch_while = self.chk_watch.isChecked()
+            job.resume = self.chk_resume.isChecked()
+            job.pct = 0.0
+            job.watch_opened = False    # part_file is kept on purpose — the
+            self._enqueue(job)          # stale-part recovery may need it
+
+    def _fix_selected(self):
+        jid = self._selected_jid()
+        if jid and self.jobs[jid].state == "error":
+            job = self.jobs[jid]
+            self.open_doctor(job.error_text, job.command)
+
+    def _open_out_dir(self):
+        jid = self._selected_jid()
+        d = self.jobs[jid].output_dir if jid else self.out_edit.text()
+        webbrowser.open(d or str(downloader.DEFAULT_OUTPUT))
+
+    # ---------------------------------------------- watch while downloading --
+    def _watch_selected(self):
+        jid = self._selected_jid()
+        if jid:
+            self._open_watch(self.jobs[jid])
+
+    def _resolve_media(self, job: Job) -> str:
+        """Best-effort locate a playable file for a job.
+
+        Order: the growing .part file (watch-while), the recorded final file,
+        then a scan of the output folder — newest matching media file first.
+        This heals cases where the recorded path is stale (yt-dlp deletes the
+        separate audio/video streams after merging, and post-processors rename
+        the result).
+        """
+        cands: list[str] = []
+        if job.part_file:
+            cands += [job.part_file + ".part", job.part_file]
+        if job.filepath:
+            cands.append(job.filepath)
+        for c in cands:
+            if c and os.path.exists(c):
+                return c
+        try:
+            entries = sorted(Path(job.output_dir).glob("*"),
+                             key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return ""
+        # the video id yt-dlp appends as "[id]" — from the URL
+        vid = video_id_from_url(job.url)
+        title = (job.title or "").strip()
+        media = [p for p in entries if p.is_file()
+                 and p.suffix.lower() in MEDIA_EXTS
+                 and not p.name.endswith(".part")]
+        for p in media:                       # best: matches id or title
+            if (vid and vid in p.name) or (title and title[:40] in p.name):
+                return str(p)
+        if media:                             # next: newest finished media file
+            return str(media[0])
+        parts = [p for p in entries            # last: growing .part file
+                 if p.is_file() and p.name.endswith(".part")]
+        return str(parts[0]) if parts else ""
+
+    def _open_watch(self, job: Job):
+        """Open the video in a media player while it is still downloading.
+
+        Prefers the growing .part file of the video stream; falls back to the
+        finished file. The download is NOT stopped — it keeps running.
+        """
+        target = self._resolve_media(job)
+        if not target:
+            QMessageBox.information(
+                self, "Watch now",
+                "Nothing to watch yet — the video data appears a few seconds "
+                "after the download starts. Try again in a moment.")
+            return
+        player = _find_player()
+        try:
+            if player:
+                subprocess.Popen([player, target],
+                                 creationflags=subprocess.DETACHED_PROCESS)
+            else:
+                os.startfile(target)   # no .part association — usually fails
+        except OSError:
+            QMessageBox.warning(
+                self, "Watch now",
+                "No media player found that can open a file while it is "
+                "downloading.\nInstalling VLC (free) makes this work: "
+                "https://www.videolan.org/")
+
+    # ------------------------------------------------------- history ----
+    def _build_history_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.history_list = QListWidget()
+        self.history_list.setWordWrap(True)
+        self.history_list.itemDoubleClicked.connect(self._open_history_item)
+        lay.addWidget(self.history_list)
+        btns = QHBoxLayout()
+        b_open = QPushButton("📁 Open selected")
+        b_open.clicked.connect(self._open_history_item)
+        b_clr = QPushButton("🗑 Clear history")
+        b_clr.clicked.connect(self._clear_history)
+        self.btn_hist_view = QPushButton()
+        self.btn_hist_view.clicked.connect(self._toggle_history_view)
+        btns.addWidget(b_open)
+        btns.addWidget(b_clr)
+        btns.addStretch(1)
+        btns.addWidget(self.btn_hist_view)
+        lay.addLayout(btns)
+        self._set_history_view(SETTINGS.get("history_view") == "thumbs")
+        self._refresh_history()
+        return w
+
+    def _set_history_view(self, thumbs: bool):
+        if thumbs:
+            self.history_list.setViewMode(QListWidget.IconMode)
+            self.history_list.setIconSize(QSize(160, 90))
+            self.history_list.setGridSize(QSize(184, 210))
+            self.history_list.setResizeMode(QListWidget.Adjust)
+            self.history_list.setMovement(QListWidget.Static)
+            self.history_list.setTextElideMode(Qt.ElideNone)
+            for i in range(self.history_list.count()):
+                self.history_list.item(i).setSizeHint(QSize(184, 210))
+        else:
+            self.history_list.setViewMode(QListWidget.ListMode)
+            self.history_list.setIconSize(QSize(24, 24))
+            self.history_list.setGridSize(QSize())
+            for i in range(self.history_list.count()):
+                self.history_list.item(i).setSizeHint(QSize())
+        self.btn_hist_view.setText("☰ List" if thumbs else "▦ Thumbnails")
+        self.btn_hist_view.setToolTip(
+            "Switch between the list view and YTDLnis-style thumbnail cards.")
+        SETTINGS["history_view"] = "thumbs" if thumbs else "list"
+        save_settings(SETTINGS)
+
+    def _toggle_history_view(self):
+        self._set_history_view(
+            self.history_list.viewMode() != QListWidget.IconMode)
+
+    def _refresh_history(self):
+        self.history_list.clear()
+        for h in SETTINGS.get("history", []):
+            item = QListWidgetItem(f"{h.get('when', '')} — {h.get('title', '')}\n"
+                                   f"    {h.get('filepath', '')}",
+                                   self.history_list)
+            path = h.get("filepath", "")
+            item.setData(Qt.UserRole, path)
+            item.setToolTip(path)
+            item.setIcon(QIcon(self.thumbs.placeholder()))
+            vid = video_id_from_url(h.get("url", "")) \
+                or video_id_from_path(path)
+            if vid:
+                def _set_icon(pm: QPixmap, it=item):
+                    try:
+                        it.setIcon(QIcon(pm))
+                    except RuntimeError:
+                        pass        # item was cleared meanwhile
+                self.thumbs.get(vid, _set_icon)
+        if self.history_list.viewMode() == QListWidget.IconMode:
+            for i in range(self.history_list.count()):
+                self.history_list.item(i).setSizeHint(QSize(184, 210))
+
+    def _open_history_item(self, item=None):
+        item = item or self.history_list.currentItem()
+        if item:
+            path = item.data(Qt.UserRole) or item.text().split("\n    ")[-1]
+            if not os.path.exists(path):
+                QMessageBox.information(
+                    self, "Open",
+                    "This file no longer exists (it may have been the "
+                    "pre-merge audio/video stream that yt-dlp deletes after "
+                    "merging):\n" + path)
+                return
+            webbrowser.open(path)
+
+    def _clear_history(self):
+        SETTINGS["history"] = []
+        save_settings(SETTINGS)
+        self._refresh_history()
+
+    # ------------------------------------------------------ settings ----
+    def _build_settings_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        eng = QGroupBox("Download engine")
+        el = QVBoxLayout(eng)
+        self.ytdlp_label = QLabel()
+        self.ffmpeg_label = QLabel()
+        el.addWidget(self.ytdlp_label)
+        el.addWidget(self.ffmpeg_label)
+        row = QHBoxLayout()
+        b_yt = QPushButton("Install / Update yt-dlp")
+        b_yt.clicked.connect(lambda: self._bootstrap(False))
+        b_ff = QPushButton("Install ffmpeg")
+        b_ff.clicked.connect(lambda: self._bootstrap(True))
+        row.addWidget(b_yt)
+        row.addWidget(b_ff)
+        row.addStretch(1)
+        el.addLayout(row)
+        lay.addWidget(eng)
+
+        doc = QGroupBox("Error Doctor")
+        dl = QFormLayout(doc)
+        self.agent_combo = QComboBox()
+        self.agent_combo.addItems(["auto", "codex", "cline", "opencode"])
+        self.agent_combo.setCurrentText(SETTINGS.get("cli_agent", "auto"))
+        dl.addRow("CLI agent for Deep Search:", self.agent_combo)
+        self.tg_edit = QLineEdit(SETTINGS.get("tg_group", "YTDLNIS"))
+        dl.addRow("Telegram group:", self.tg_edit)
+        self.tg_topic_edit = QLineEdit(SETTINGS.get("tg_topic", "general"))
+        dl.addRow("Telegram topic:", self.tg_topic_edit)
+        kb = QLabel(str(knowledge.STORE))
+        kb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        dl.addRow("Knowledge base:", kb)
+        lay.addWidget(doc)
+
+        btn_save = QPushButton("💾 Save settings")
+        btn_save.clicked.connect(self._save_all)
+        lay.addWidget(btn_save)
+        lay.addStretch(1)
+        self._refresh_engine_labels()
+        return w
+
+    def _refresh_engine_labels(self):
+        self.ytdlp_label.setText(f"yt-dlp: {mgr.ytdlp_version()}")
+        self.ffmpeg_label.setText(
+            "ffmpeg: installed ✔" if mgr.ffmpeg_available()
+            else "ffmpeg: not installed (needed for high-quality merging & MP3)")
+
+    def _save_all(self):
+        SETTINGS["cli_agent"] = self.agent_combo.currentText()
+        SETTINGS["tg_group"] = self.tg_edit.text().strip() or "YTDLNIS"
+        SETTINGS["tg_topic"] = self.tg_topic_edit.text().strip() or "general"
+        SETTINGS["output_dir"] = self.out_edit.text().strip()
+        SETTINGS["cookies_file"] = self.cookies_edit.text().strip()
+        SETTINGS["extra_args"] = self.extra_edit.text().strip()
+        SETTINGS["preset"] = self.preset_combo.currentText()
+        save_settings(SETTINGS)
+        self.statusBar().showMessage("Settings saved.", 4000)
+
+    # ------------------------------------------------------ bootstrap ----
+    def _bootstrap(self, with_ffmpeg: bool):
+        self.statusBar().showMessage("Downloading engine …")
+        self.bootstrap = BootstrapWorker(with_ffmpeg)
+        self.bootstrap.step.connect(self.statusBar().showMessage)
+        self.bootstrap.done.connect(self._bootstrap_done)
+        self.bootstrap.start()
+
+    def _bootstrap_done(self, ok: bool, msg: str):
+        self.statusBar().showMessage(msg, 6000)
+        self._refresh_engine_labels()
+        if not ok:
+            QMessageBox.warning(self, "TubeSage", msg)
+
+    # -------------------------------------------------------- doctor ----
+    def open_doctor(self, error_text: str, yt_command: str):
+        dlg = ErrorDoctorDialog(error_text or "(no error text — describe "
+                                "what went wrong)", yt_command, self)
+        dlg.exec()
+
+# --------------------------------------------------------------- main ----
+def _find_player() -> str | None:
+    """A media player that tolerates half-written files (VLC/mpv are ideal)."""
+    for name in ("vlc", "mpv"):
+        p = shutil.which(name)
+        if p:
+            return p
+    for c in (r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+              r"C:\Program Files\MPV\mpv.exe",
+              r"C:\Program Files (x86)\Windows Media Player\wmplayer.exe",
+              r"C:\Program Files\Windows Media Player\wmplayer.exe"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("TubeSage")
+    win = MainWindow()
+    win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+
+
+
+
