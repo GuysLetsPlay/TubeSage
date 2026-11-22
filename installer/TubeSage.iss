@@ -7,9 +7,10 @@ AppId={{C6488A8C-82AB-4E49-82B9-89BCF426879A}
 AppName=TubeSage
 AppVersion={#AppVersion}
 AppPublisher=GuysLetsPlay
-DefaultDirName={autopf}\TubeSage
+DefaultDirName={code:GetPreviousInstallPath}
 DefaultGroupName=TubeSage
 DisableProgramGroupPage=yes
+UsePreviousAppDir=no
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
 ArchitecturesAllowed=x64
@@ -32,3 +33,18 @@ Name: "{autodesktop}\TubeSage"; Filename: "{app}\TubeSage.exe"; Tasks: desktopic
 
 [Run]
 Filename: "{app}\TubeSage.exe"; Description: "Launch TubeSage"; Flags: postinstall nowait skipifsilent
+
+[Code]
+function GetPreviousInstallPath(Param: string): string;
+var
+  PreviousPath: string;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{C6488A8C-82AB-4E49-82B9-89BCF426879A}_is1',
+    'Inno Setup: App Path', PreviousPath) then
+    if not RegQueryStringValue(HKEY_LOCAL_MACHINE,
+      'Software\Microsoft\Windows\CurrentVersion\Uninstall\{C6488A8C-82AB-4E49-82B9-89BCF426879A}_is1',
+      'Inno Setup: App Path', PreviousPath) then
+      PreviousPath := ExpandConstant('{autopf}\TubeSage');
+  Result := PreviousPath;
+end;
