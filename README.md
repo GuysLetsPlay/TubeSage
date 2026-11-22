@@ -30,9 +30,9 @@ only download it from this repository's Releases page.
   TubeSage lists matching VODs and refreshes automatically; check the recordings
   to download in six-hour files during your chosen time window, up to the
   configured storage allowance, with pause/resume, a download speed limit, and
-  per-VOD files named Episode 1, Episode 2, and so on
-- Open each VOD's folder and YouTube Studio to upload the files manually, then
-  mark that VOD done or delete its local files
+  per-VOD files named E1, E2, and so on, with the Twitch VOD ID in each filename
+- Expand each VOD to track downloaded and uploaded status per segment, and delete
+  individual segment files after upload
 - Error Doctor with yt-dlp GitHub issue search, optional YTDLNIS Telegram
   reader, and deep research through an installed Codex, Cline, or OpenCode CLI
 

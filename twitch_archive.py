@@ -30,6 +30,46 @@ def vod_folder(root: str, vod: dict) -> Path:
     return Path(root) / f"{safe_name(vod.get('title', 'VOD'))} [{vod.get('id', '')}]"
 
 
+def segment_files(folder: Path, vod: dict, segment: int) -> list[Path]:
+    """Return existing final or partial files for one segment, including legacy names."""
+    vod_id = str(vod.get("id", ""))
+    prefixes = (f"E{segment + 1} - ", f"Episode {segment + 1} - ")
+    numeric_id = vod_id.removeprefix("v")
+    markers = (f"[{vod_id}]", f"[VOD ID {numeric_id}]")
+    try:
+        return [path for path in folder.iterdir()
+                if path.is_file() and path.name.startswith(prefixes)
+                and any(marker in path.name for marker in markers)]
+    except OSError:
+        return []
+
+
+def migrate_legacy_segment_names(folder: Path, vod: dict) -> None:
+    """Rename old Episode N outputs so yt-dlp can resume under the E<N> template."""
+    vod_id = str(vod.get("id", ""))
+    try:
+        paths = list(folder.iterdir())
+    except OSError:
+        return
+    for path in paths:
+        if not path.is_file():
+            continue
+        marker = re.escape(f"[{vod_id}]")
+        if not re.search(marker, path.name):
+            continue
+        match = re.match(r"^(?:Episode |E)(\d+) - (.+)$", path.name)
+        if not match:
+            continue
+        suffix = f"[VOD ID {vod_id.removeprefix('v')}]"
+        body = re.sub(marker + r"(?=\.)", suffix, match.group(2))
+        target = path.with_name(f"E{match.group(1)} - {body}")
+        if not target.exists():
+            try:
+                path.rename(target)
+            except OSError:
+                pass
+
+
 def parse_date(raw: str) -> date | None:
     if isinstance(raw, (int, float)):
         try:
@@ -250,12 +290,9 @@ class ArchiveDownloadWorker(QThread):
                 break
             if self._pause_requested:
                 break
-            if vod.get("status") in ("done", "downloaded"):
-                continue
             if self.max_bytes and directory_size(self.output_root) >= self.max_bytes:
                 for candidate in self.vods:
-                    if candidate.get("status") not in ("done", "downloaded"):
-                        self.changed.emit(candidate["id"], "storage-full", "Storage allowance reached")
+                    self.changed.emit(candidate["id"], "storage-full", "Storage allowance reached")
                 self.progress.emit("Storage allowance reached. Increase it or free space to continue.")
                 break
             folder = vod_folder(str(self.output_root), vod)
@@ -267,14 +304,14 @@ class ArchiveDownloadWorker(QThread):
             for segment in range(count):
                 if self._cancel or not self._wait_for_window():
                     break
-                if segment in vod.get("segments_done", []):
+                if segment in vod.get("segments_done", []) or segment in vod.get("segments_uploaded", []):
                     continue
                 if self.max_bytes and directory_size(self.output_root) >= self.max_bytes:
                     failed = "Storage allowance reached"
                     break
                 start = segment * SEGMENT_SECONDS
                 finish = min(duration, start + SEGMENT_SECONDS)
-                template = str(folder / f"E{segment + 1} - %(title)s [%(id)s].%(ext)s")
+                template = str(folder / f"E{segment + 1} - %(title)s [VOD ID {str(vod['id']).removeprefix('v')}].%(ext)s")
                 args = [str(exe), "--newline", "--continue", "--no-playlist",
                         "--download-sections",
                         f"*{format_timestamp(start)}-{format_timestamp(finish)}",
@@ -321,8 +358,7 @@ class ArchiveDownloadWorker(QThread):
                     break
                 if failed == "Storage allowance reached":
                     for candidate in self.vods:
-                        if candidate.get("status") not in ("done", "downloaded"):
-                            self.changed.emit(candidate["id"], "storage-full", "Storage allowance reached")
+                        self.changed.emit(candidate["id"], "storage-full", "Storage allowance reached")
                     break
                 if code:
                     failed = failed or f"yt-dlp stopped on segment {segment + 1} (exit {code})"
@@ -341,7 +377,10 @@ class ArchiveDownloadWorker(QThread):
                 if state == "storage-full":
                     break
             elif len(set(vod.get("segments_done", []))) >= count:
-                self.changed.emit(vod["id"], "downloaded", "Ready for manual YouTube Studio upload")
+                if all(index in vod.get("segments_uploaded", []) for index in range(count)):
+                    self.changed.emit(vod["id"], "done", "All segments uploaded")
+                else:
+                    self.changed.emit(vod["id"], "downloaded", "Ready for manual YouTube Studio upload")
             else:
                 self.changed.emit(vod["id"], "paused", "Download window closed; will resume")
         self.stopped.emit()

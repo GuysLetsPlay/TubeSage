@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget, QDateEdit, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget, QDateEdit,
     QHeaderView, QDoubleSpinBox, QTimeEdit, QSpinBox)
 from PySide6.QtWidgets import QScrollArea
 
@@ -1090,13 +1090,10 @@ class MainWindow(QMainWindow):
         al.addLayout(archive_form)
 
         archive_help = QLabel(
-            "TubeSage lists public Twitch archive VODs. Select the recordings you want and choose Download selected; "
-            "each is downloaded in six-hour files. A start date with no end date keeps searching forward. "
-            "Set an end date for a fixed range. "
-            "Files are named Episode 1, Episode 2, and so on for each VOD. Pause preserves the current partial file, "
-            "and Resume continues it. Set the maximum speed in KB/s, or use 0 for unlimited speed. "
-            "Downloaded files stay here until you upload them manually in YouTube Studio and mark the VOD done. "
-            "Install ffmpeg in the Download engine section for segmented downloads.")
+            "TubeSage lists public Twitch archive VODs. Expand a VOD to see its six-hour segments. "
+            "Completed segment files are checked automatically; check Uploaded after YouTube Studio, "
+            "or use that segment's Delete button. Pause preserves the partial file, and Resume continues it. "
+            "Set the maximum speed in KB/s, or use 0 for unlimited speed. Install ffmpeg in the Download engine section.")
         archive_help.setWordWrap(True)
         al.addWidget(archive_help)
         archive_actions = QHBoxLayout()
@@ -1120,16 +1117,19 @@ class MainWindow(QMainWindow):
         self.archive_status = QLabel("No Twitch archive search yet.")
         self.archive_status.setWordWrap(True)
         al.addWidget(self.archive_status)
-        self.archive_table = QTableWidget(0, 4)
-        self.archive_table.setHorizontalHeaderLabels(["Select / VOD", "Stream date", "Status", "Details"])
-        self.archive_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.archive_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.archive_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.archive_table.verticalHeader().setVisible(False)
-        self.archive_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.archive_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.archive_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.archive_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.archive_table = QTreeWidget()
+        self.archive_table.setColumnCount(5)
+        self.archive_table.setHeaderLabels(["VOD / Segment", "Stream date", "Downloaded / Status",
+                                            "Uploaded / Details", "Actions"])
+        self.archive_table.setSelectionBehavior(QTreeWidget.SelectRows)
+        self.archive_table.setSelectionMode(QTreeWidget.SingleSelection)
+        self.archive_table.setEditTriggers(QTreeWidget.NoEditTriggers)
+        self.archive_table.setUniformRowHeights(False)
+        self.archive_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.archive_table.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.archive_table.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.archive_table.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.archive_table.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.archive_table.itemChanged.connect(self._archive_item_changed)
         self.archive_table.itemDoubleClicked.connect(self._archive_open_twitch)
         al.addWidget(self.archive_table, 1)
@@ -1144,9 +1144,7 @@ class MainWindow(QMainWindow):
         file_buttons = QHBoxLayout()
         for title, callback in (("Open Twitch VOD", self._archive_open_twitch),
                                 ("Open VOD folder", self._archive_open_folder),
-                                ("Mark uploaded / done", self._archive_mark_done),
-                                ("Retry failed", self._archive_retry_failed),
-                                ("Delete local files", self._archive_delete_files)):
+                                ("Retry failed", self._archive_retry_failed)):
             button = QPushButton(title)
             button.clicked.connect(callback)
             file_buttons.addWidget(button)
@@ -1231,6 +1229,23 @@ class MainWindow(QMainWindow):
     def _restore_archive_controls(self):
         a = self._archive_settings()
         for vod in a.get("vods", []):
+            vod.setdefault("segments_done", [])
+            vod.setdefault("segments_uploaded", [])
+            folder = twitch_archive.vod_folder(a.get("output_dir", ""), vod)
+            twitch_archive.migrate_legacy_segment_names(folder, vod)
+            done = {int(i) for i in vod.get("segments_done", [])}
+            uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
+            count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                           + twitch_archive.SEGMENT_SECONDS - 1) // twitch_archive.SEGMENT_SECONDS)
+            if vod.get("status") == "done":
+                done.update(range(count))
+                uploaded.update(range(count))
+            for segment in range(count):
+                files = twitch_archive.segment_files(folder, vod, segment)
+                if any(not path.name.endswith((".part", ".ytdl")) for path in files):
+                    done.add(segment)
+            vod["segments_done"] = sorted(done)
+            vod["segments_uploaded"] = sorted(uploaded)
             if vod.get("status") == "downloading":
                 vod["status"] = "paused"
                 vod["error"] = "Paused when TubeSage closed; will resume automatically"
@@ -1329,40 +1344,85 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "archive_table"):
             return
         vods = self._archive_settings().get("vods", [])
-        self.archive_table.setRowCount(len(vods))
+        expanded = {str(self.archive_table.topLevelItem(i).data(0, Qt.UserRole))
+                    for i in range(self.archive_table.topLevelItemCount())
+                    if self.archive_table.topLevelItem(i).isExpanded()}
+        self.archive_table.clear()
         self.archive_table.blockSignals(True)
-        for row, vod in enumerate(vods):
+        for vod in vods:
             status = vod.get("status", "queued")
             status_label = {
-                "downloaded": "✅ Downloaded",
-                "done": "✓ Done",
-                "downloading": "⬇ Downloading",
-                "paused": "⏸ Paused",
-                "error": "⚠ Error",
-                "storage-full": "⛔ Storage full",
-                "live": "🔴 Live now",
-                "found": "Found — select to download",
+                "downloaded": "Downloaded",
+                "done": "Uploaded",
+                "downloading": "Downloading",
+                "paused": "Paused",
+                "error": "Error",
+                "storage-full": "Storage full",
+                "live": "Live now",
+                "found": "Found - select to download",
             }.get(status, "Queued")
             details = vod.get("error", "")
-            if vod.get("status") == "downloaded":
+            if status == "downloaded":
                 details = "Ready to upload in YouTube Studio"
-            elif vod.get("status") == "done":
-                details = "Uploaded; retained until you delete the files"
-            for column, value in enumerate((vod.get("title", ""), vod.get("date", ""),
-                                             status_label, details)):
-                item = QTableWidgetItem(str(value))
-                item.setData(Qt.UserRole, str(vod.get("id", "")))
-                if column == 0:
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    default_selected = vod.get("status") in ("queued", "paused")
-                    item.setCheckState(Qt.Checked if vod.get("selected", default_selected)
-                                       else Qt.Unchecked)
-                    item.setToolTip(vod.get("url", ""))
-                self.archive_table.setItem(row, column, item)
+            elif status == "done":
+                details = "All segments uploaded"
+            vod_id = str(vod.get("id", ""))
+            done = {int(i) for i in vod.get("segments_done", [])}
+            count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                           + twitch_archive.SEGMENT_SECONDS - 1) // twitch_archive.SEGMENT_SECONDS)
+            parent = QTreeWidgetItem([str(vod.get("title", "")), str(vod.get("date", "")),
+                                      status_label, f"{len(done)}/{count} segments downloaded",
+                                      details or "Segments"])
+            parent.setData(0, Qt.UserRole, vod_id)
+            parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable)
+            default_selected = status in ("queued", "paused", "found")
+            parent.setCheckState(0, Qt.Checked if vod.get("selected", default_selected)
+                                 else Qt.Unchecked)
+            parent.setToolTip(0, vod.get("url", ""))
+            self.archive_table.addTopLevelItem(parent)
+            folder = twitch_archive.vod_folder(self._archive_settings().get("output_dir", ""), vod)
+            uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
+            for segment in range(count):
+                files = twitch_archive.segment_files(folder, vod, segment)
+                downloaded = segment in done or any(
+                    not path.name.endswith((".part", ".ytdl")) for path in files)
+                if downloaded:
+                    done.add(segment)
+                label = f"E{segment + 1}"
+                label += f" - {files[0].name}" if files else " - not downloaded"
+                child = QTreeWidgetItem([label, "", "", "", ""])
+                child.setData(0, Qt.UserRole, vod_id)
+                child.setData(0, Qt.UserRole + 1, segment)
+                child.setFlags(child.flags() & ~Qt.ItemIsSelectable)
+                parent.addChild(child)
+                downloaded_box = QCheckBox("Downloaded")
+                downloaded_box.setChecked(downloaded)
+                downloaded_box.setEnabled(False)
+                downloaded_box.setToolTip("Checked automatically when the segment file is complete")
+                downloaded_box.toggled.connect(
+                    lambda checked, vid=vod_id, seg=segment: self._archive_set_segment_downloaded(
+                        vid, seg, checked))
+                self.archive_table.setItemWidget(child, 2, downloaded_box)
+                uploaded_box = QCheckBox("Uploaded")
+                uploaded_box.setChecked(segment in uploaded)
+                uploaded_box.setEnabled(downloaded)
+                uploaded_box.toggled.connect(
+                    lambda checked, vid=vod_id, seg=segment: self._archive_set_segment_uploaded(
+                        vid, seg, checked))
+                self.archive_table.setItemWidget(child, 3, uploaded_box)
+                delete_button = QPushButton("Delete")
+                delete_button.setEnabled(self.archive_worker is None
+                                         or not self.archive_worker.isRunning())
+                delete_button.clicked.connect(
+                    lambda _checked=False, vid=vod_id, seg=segment:
+                    self._archive_delete_segment(vid, seg))
+                self.archive_table.setItemWidget(child, 4, delete_button)
+            vod["segments_done"] = sorted(done)
+            parent.setExpanded(vod_id in expanded)
         self.archive_table.blockSignals(False)
 
     def _archive_item_changed(self, item):
-        if item.column() != 0:
+        if item.column() != 0 or item.parent() is not None:
             return
         vod_id = str(item.data(Qt.UserRole))
         a = self._archive_settings()
@@ -1372,6 +1432,100 @@ class MainWindow(QMainWindow):
                 break
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
+
+    def _archive_find_vod(self, vod_id: str):
+        a = self._archive_settings()
+        vod = next((v for v in a.get("vods", []) if str(v.get("id")) == str(vod_id)), None)
+        return a, vod
+
+    def _archive_set_segment_downloaded(self, vod_id: str, segment: int, downloaded: bool):
+        a, vod = self._archive_find_vod(vod_id)
+        if not vod:
+            return
+        done = {int(i) for i in vod.get("segments_done", [])}
+        if downloaded:
+            files = twitch_archive.segment_files(twitch_archive.vod_folder(a["output_dir"], vod),
+                                                 vod, segment)
+            if not any(not path.name.endswith((".part", ".ytdl")) for path in files):
+                QMessageBox.information(self, "TubeSage", "The completed segment file was not found.")
+                self._refresh_archive_table()
+                return
+            done.add(segment)
+        else:
+            done.discard(segment)
+        vod["segments_done"] = sorted(done)
+        count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                       + twitch_archive.SEGMENT_SECONDS - 1) // twitch_archive.SEGMENT_SECONDS)
+        if all(i in done for i in range(count)):
+            vod["status"] = "downloaded"
+            vod["selected"] = False
+        elif vod.get("status") in ("downloaded", "done"):
+            vod["status"] = "queued"
+            vod["selected"] = True
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._refresh_archive_table()
+
+    def _archive_set_segment_uploaded(self, vod_id: str, segment: int, uploaded: bool):
+        a, vod = self._archive_find_vod(vod_id)
+        if not vod:
+            return
+        segments = {int(i) for i in vod.get("segments_uploaded", [])}
+        if uploaded:
+            done = {int(i) for i in vod.get("segments_done", [])}
+            files = twitch_archive.segment_files(twitch_archive.vod_folder(a["output_dir"], vod),
+                                                 vod, segment)
+            if segment not in done or not any(
+                    not path.name.endswith((".part", ".ytdl")) for path in files):
+                QMessageBox.information(self, "TubeSage", "Mark the completed segment as downloaded first.")
+                self._refresh_archive_table()
+                return
+            segments.add(segment)
+        else:
+            segments.discard(segment)
+        vod["segments_uploaded"] = sorted(segments)
+        count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                       + twitch_archive.SEGMENT_SECONDS - 1) // twitch_archive.SEGMENT_SECONDS)
+        if all(i in segments for i in range(count)) and vod.get("status") == "downloaded":
+            vod["status"] = "done"
+        elif vod.get("status") == "done":
+            vod["status"] = "downloaded"
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._refresh_archive_table()
+
+    def _archive_delete_segment(self, vod_id: str, segment: int):
+        a, vod = self._archive_find_vod(vod_id)
+        if not vod:
+            return
+        if self.archive_worker and self.archive_worker.isRunning():
+            QMessageBox.information(self, "TubeSage", "Pause downloads before deleting a segment.")
+            return
+        files = twitch_archive.segment_files(twitch_archive.vod_folder(a["output_dir"], vod),
+                                             vod, segment)
+        if not files:
+            return
+        confirm = QMessageBox.question(self, "Delete segment files?",
+                                       "Permanently delete these files?\n\n" +
+                                       "\n".join(path.name for path in files))
+        if confirm != QMessageBox.Yes:
+            return
+        for path in files:
+            try:
+                path.unlink()
+            except OSError as exc:
+                QMessageBox.warning(self, "TubeSage", f"Could not delete {path.name}: {exc}")
+        done = {int(i) for i in vod.get("segments_done", [])}
+        uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
+        if segment not in uploaded:
+            done.discard(segment)
+            vod["segments_done"] = sorted(done)
+        if vod.get("status") in ("downloaded", "done") and segment not in uploaded:
+            vod["status"] = "queued"
+            vod["selected"] = True
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._refresh_archive_table()
 
     def _archive_set_selection(self, selected: bool):
         a = self._archive_settings()
@@ -1389,13 +1543,12 @@ class MainWindow(QMainWindow):
         self._archive_set_selection(False)
 
     def _selected_archive_vod(self):
-        row = self.archive_table.currentRow()
-        if row < 0:
-            return None
-        item = self.archive_table.item(row, 0)
+        item = self.archive_table.currentItem()
         if item is None:
             return None
-        vod_id = item.data(Qt.UserRole)
+        if item.parent() is not None:
+            item = item.parent()
+        vod_id = item.data(0, Qt.UserRole)
         return next((v for v in self._archive_settings().get("vods", [])
                      if str(v.get("id")) == str(vod_id)), None)
 
@@ -1411,37 +1564,6 @@ class MainWindow(QMainWindow):
         folder = twitch_archive.vod_folder(self.archive_folder.text(), vod)
         folder.mkdir(parents=True, exist_ok=True)
         os.startfile(str(folder))
-
-    def _archive_mark_done(self):
-        vod = self._selected_archive_vod()
-        if not vod:
-            return
-        if vod.get("status") != "downloaded":
-            QMessageBox.information(self, "TubeSage", "Download all VOD segments, upload them manually in YouTube Studio, then mark this VOD done.")
-            return
-        vod["status"] = "done"
-        vod["selected"] = False
-        vod["error"] = ""
-        self._save_archive_settings()
-        self._refresh_archive_table()
-
-    def _archive_delete_files(self):
-        vod = self._selected_archive_vod()
-        if not vod:
-            return
-        folder = twitch_archive.vod_folder(self.archive_folder.text(), vod)
-        if not folder.exists():
-            return
-        confirm = QMessageBox.question(self, "Delete downloaded files?",
-                                       f"Permanently delete files in:\n{folder}")
-        if confirm != QMessageBox.Yes:
-            return
-        shutil.rmtree(folder, ignore_errors=True)
-        vod["segments_done"] = []
-        vod["status"] = "done" if vod.get("status") in ("downloaded", "done") else "queued"
-        vod["error"] = ""
-        self._save_archive_settings()
-        self._refresh_archive_table()
 
     def _archive_retry_failed(self):
         for vod in self._archive_settings().get("vods", []):
@@ -1460,7 +1582,7 @@ class MainWindow(QMainWindow):
             return
         pending = [dict(v) for v in a.get("vods", [])
                    if v.get("selected", v.get("status") in ("queued", "paused"))
-                   and v.get("status") in ("found", "queued", "paused", "storage-full")]
+                   and v.get("status") not in ("live", "error")]
         if not pending:
             return
         self._save_archive_settings()
@@ -1521,6 +1643,7 @@ class MainWindow(QMainWindow):
                 break
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
+        self._refresh_archive_table()
 
     def _archive_state_changed(self, vod_id: str, state: str, detail: str):
         a = self._archive_settings()
