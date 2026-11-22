@@ -274,7 +274,7 @@ class ArchiveDownloadWorker(QThread):
                     break
                 start = segment * SEGMENT_SECONDS
                 finish = min(duration, start + SEGMENT_SECONDS)
-                template = str(folder / f"Episode {segment + 1} - Twitch VOD %(id)s - %(title)s.%(ext)s")
+                template = str(folder / f"E{segment + 1} - %(title)s [%(id)s].%(ext)s")
                 args = [str(exe), "--newline", "--continue", "--no-playlist",
                         "--download-sections",
                         f"*{format_timestamp(start)}-{format_timestamp(finish)}",
