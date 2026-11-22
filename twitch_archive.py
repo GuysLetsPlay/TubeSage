@@ -7,6 +7,7 @@ import subprocess
 import time
 from subprocess import TimeoutExpired
 from datetime import date, datetime, time as clock_time
+import math
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -56,7 +57,7 @@ class VodSearchWorker(QThread):
 
     def __init__(self, streamer: str, start_date: str, end_date: str = "", parent=None):
         super().__init__(parent)
-        self.streamer = streamer.strip().lstrip("@")
+        self.streamer = streamer.strip().lstrip("@").lower()
         self.start_date = date.fromisoformat(start_date)
         self.end_date = date.fromisoformat(end_date) if end_date else None
         self._cancel = False
@@ -82,9 +83,14 @@ class VodSearchWorker(QThread):
             self.failed.emit("yt-dlp is not installed yet. Finish setup in TubeSage first.")
             return
         url = f"https://www.twitch.tv/{self.streamer}/videos?filter=archives&sort=time"
+        date_span = ((self.end_date or date.today()) - self.start_date).days + 1
+        playlist_limit = min(1000, max(100, math.ceil(date_span * 4)))
         self.progress.emit(f"Checking Twitch archives for {self.streamer}…")
-        args = [str(exe), "--dump-single-json", "--flat-playlist", "--yes-playlist",
-                "--playlist-end", "10000", "--no-warnings", url]
+        # Do not use --flat-playlist here. Twitch's flat entries omit upload_date,
+        # so filtering them by date drops every VOD. Expanding playlist entries
+        # makes yt-dlp resolve the dates and durations needed by the archive UI.
+        args = [str(exe), "--dump-single-json", "--yes-playlist",
+                "--playlist-end", str(playlist_limit), "--no-warnings", url]
         try:
             self._proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                           stderr=subprocess.STDOUT, text=True,
@@ -133,10 +139,13 @@ class VodSearchWorker(QThread):
                 "date": uploaded.isoformat(),
                 "duration": int(entry.get("duration") or 0),
                 "url": entry.get("webpage_url") or f"https://www.twitch.tv/videos/{vid}",
-                "status": "queued",
+                "status": "found",
                 "segments_done": [],
                 "error": "",
+                "selected": False,
             })
+            if entry.get("live_status") == "is_live":
+                output[-1]["status"] = "live"
         output.sort(key=lambda item: (item["date"], item["id"]))
         self.found.emit(output)
 

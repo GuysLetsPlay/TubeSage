@@ -27,8 +27,9 @@ only download it from this repository's Releases page.
 - Resume failed downloads, watch supported videos while they download, and
   browse queue/history as thumbnail cards
 - Twitch archive mode: select a streamer and start date, or a fixed date range;
-  TubeSage refreshes the archive automatically and downloads VODs in six-hour
-  files during your chosen time window until the storage allowance is reached
+  TubeSage lists matching VODs and refreshes automatically; check the recordings
+  to download in six-hour files during your chosen time window, up to the
+  configured storage allowance
 - Open each VOD's folder and YouTube Studio to upload the files manually, then
   mark that VOD done or delete its local files
 - Error Doctor with yt-dlp GitHub issue search, optional YTDLNIS Telegram
