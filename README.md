@@ -29,7 +29,8 @@ only download it from this repository's Releases page.
 - Twitch archive mode: select a streamer and start date, or a fixed date range;
   TubeSage lists matching VODs and refreshes automatically; check the recordings
   to download in six-hour files during your chosen time window, up to the
-  configured storage allowance
+  configured storage allowance, with pause/resume, a download speed limit, and
+  per-VOD files named Episode 1, Episode 2, and so on
 - Open each VOD's folder and YouTube Studio to upload the files manually, then
   mark that VOD done or delete its local files
 - Error Doctor with yt-dlp GitHub issue search, optional YTDLNIS Telegram

@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget, QDateEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QDoubleSpinBox, QTimeEdit)
+    QHeaderView, QDoubleSpinBox, QTimeEdit, QSpinBox)
 from PySide6.QtWidgets import QScrollArea
 
 from app_paths import DATA_DIR
@@ -53,6 +53,7 @@ DEFAULT_SETTINGS = {
     "tg_group": error_doctor.DEFAULT_GROUP,
     "tg_topic": error_doctor.DEFAULT_TOPIC,
     "preset": "Best quality",
+    "download_speed_limit_kbs": 0,
     "history": [],          # [{title, filepath, when}]
 }
 
@@ -421,6 +422,7 @@ class MainWindow(QMainWindow):
         self.meta_worker: MetaWorker | None = None
         self.archive_search: VodSearchWorker | None = None
         self.archive_worker: ArchiveDownloadWorker | None = None
+        self._resume_after_pause = False
         self.archive_timer = QTimer(self)
         self.archive_timer.setInterval(30_000)
         self.archive_timer.timeout.connect(self._archive_tick)
@@ -475,6 +477,17 @@ class MainWindow(QMainWindow):
         self.preset_combo.addItems([p[0] for p in downloader.PRESETS])
         self.preset_combo.setCurrentText(SETTINGS.get("preset", "Best quality"))
         form.addRow("Quality / format:", self.preset_combo)
+
+        self.download_speed_limit = QSpinBox()
+        self.download_speed_limit.setRange(0, 100000)
+        self.download_speed_limit.setSingleStep(100)
+        self.download_speed_limit.setSuffix(" KB/s (0 = unlimited)")
+        self.download_speed_limit.setValue(int(SETTINGS.get("download_speed_limit_kbs", 0)))
+        self.download_speed_limit.setToolTip(
+            "Applies to TubeSage downloads, including the Twitch archive. "
+            "Pause and resume an active archive to apply a changed limit.")
+        self.download_speed_limit.valueChanged.connect(self._save_speed_limit)
+        form.addRow("Maximum download speed:", self.download_speed_limit)
 
         self.out_edit = QLineEdit(SETTINGS.get("output_dir", ""))
         btn_out = QPushButton("…")
@@ -585,6 +598,7 @@ class MainWindow(QMainWindow):
             url=url,
             preset=self.preset_combo.currentText(),
             output_dir=self.out_edit.text().strip() or str(downloader.DEFAULT_OUTPUT),
+            speed_limit_kbs=self.download_speed_limit.value(),
             playlist=self.chk_playlist.isChecked(),
             subtitles=self.chk_subs.isChecked(),
             embed_thumbnail=self.chk_thumb.isChecked(),
@@ -1079,6 +1093,8 @@ class MainWindow(QMainWindow):
             "TubeSage lists public Twitch archive VODs. Select the recordings you want and choose Download selected; "
             "each is downloaded in six-hour files. A start date with no end date keeps searching forward. "
             "Set an end date for a fixed range. "
+            "Files are named Episode 1, Episode 2, and so on for each VOD. Pause preserves the current partial file, "
+            "and Resume continues it. Set the maximum speed in KB/s, or use 0 for unlimited speed. "
             "Downloaded files stay here until you upload them manually in YouTube Studio and mark the VOD done. "
             "Install ffmpeg in the Download engine section for segmented downloads.")
         archive_help.setWordWrap(True)
@@ -1088,10 +1104,16 @@ class MainWindow(QMainWindow):
         find_vods.clicked.connect(self._archive_search)
         download_selected = QPushButton("Download selected")
         download_selected.clicked.connect(self._archive_tick)
+        self.archive_pause_button = QPushButton("Pause downloads")
+        self.archive_pause_button.clicked.connect(self._archive_pause)
+        self.archive_resume_button = QPushButton("Resume downloads")
+        self.archive_resume_button.clicked.connect(self._archive_resume)
         open_studio = QPushButton("Open YouTube Studio")
         open_studio.clicked.connect(lambda: webbrowser.open("https://studio.youtube.com/"))
         archive_actions.addWidget(find_vods)
         archive_actions.addWidget(download_selected)
+        archive_actions.addWidget(self.archive_pause_button)
+        archive_actions.addWidget(self.archive_resume_button)
         archive_actions.addWidget(open_studio)
         archive_actions.addStretch(1)
         al.addLayout(archive_actions)
@@ -1167,6 +1189,7 @@ class MainWindow(QMainWindow):
         SETTINGS["cookies_file"] = self.cookies_edit.text().strip()
         SETTINGS["extra_args"] = self.extra_edit.text().strip()
         SETTINGS["preset"] = self.preset_combo.currentText()
+        SETTINGS["download_speed_limit_kbs"] = self.download_speed_limit.value()
         self._save_archive_settings()
         save_settings(SETTINGS)
         if self.archive_auto_refresh.isChecked():
@@ -1174,6 +1197,10 @@ class MainWindow(QMainWindow):
         else:
             self.archive_scan_timer.stop()
         self.statusBar().showMessage("Settings saved.", 4000)
+
+    def _save_speed_limit(self, value: int):
+        SETTINGS["download_speed_limit_kbs"] = int(value)
+        save_settings(SETTINGS)
 
     # ------------------------------------------------ Twitch archive ----
     def _archive_defaults(self) -> dict:
@@ -1183,6 +1210,7 @@ class MainWindow(QMainWindow):
             "end_date": today.toString("yyyy-MM-dd"), "date_mode": "range",
             "output_dir": str(downloader.DEFAULT_OUTPUT / "Twitch Archive"),
             "start_time": "06:00", "end_time": "23:00", "max_gb": 500,
+            "paused": False,
             "auto_refresh": True, "vods": [],
         }
 
@@ -1222,6 +1250,7 @@ class MainWindow(QMainWindow):
         self.archive_start_time.setTime(self.archive_start_time.time().fromString(a.get("start_time", "06:00"), "HH:mm"))
         self.archive_end_time.setTime(self.archive_end_time.time().fromString(a.get("end_time", "23:00"), "HH:mm"))
         self.archive_limit.setValue(float(a.get("max_gb", 500)))
+        self._set_archive_pause_button(bool(a.get("paused", False)))
         self.archive_auto_refresh.setChecked(bool(a.get("auto_refresh", True)))
 
     def _save_archive_settings(self):
@@ -1235,6 +1264,7 @@ class MainWindow(QMainWindow):
             "start_time": self.archive_start_time.time().toString("HH:mm"),
             "end_time": self.archive_end_time.time().toString("HH:mm"),
             "max_gb": self.archive_limit.value(),
+            "paused": self._archive_settings().get("paused", False),
             "auto_refresh": self.archive_auto_refresh.isChecked(),
         })
         if hasattr(self, "archive_table"):
@@ -1426,6 +1456,8 @@ class MainWindow(QMainWindow):
         if self.archive_worker and self.archive_worker.isRunning():
             return
         a = self._archive_settings()
+        if a.get("paused", False):
+            return
         pending = [dict(v) for v in a.get("vods", [])
                    if v.get("selected", v.get("status") in ("queued", "paused"))
                    and v.get("status") in ("found", "queued", "paused", "storage-full")]
@@ -1435,11 +1467,49 @@ class MainWindow(QMainWindow):
         a = self._archive_settings()
         self.archive_worker = ArchiveDownloadWorker(
             pending, a["output_dir"], a["start_time"], a["end_time"],
-            float(a["max_gb"]), self)
+            float(a["max_gb"]), int(SETTINGS.get("download_speed_limit_kbs", 0)), self)
         self.archive_worker.progress.connect(self.archive_status.setText)
         self.archive_worker.changed.connect(self._archive_state_changed)
         self.archive_worker.segment_done.connect(self._archive_segment_done)
+        self.archive_worker.stopped.connect(self._archive_worker_stopped)
+        self.archive_worker.finished.connect(self._archive_worker_finished)
         self.archive_worker.start()
+
+    def _set_archive_pause_button(self, paused: bool):
+        self.archive_pause_button.setEnabled(not paused)
+        self.archive_resume_button.setEnabled(paused)
+
+    def _archive_pause(self):
+        a = self._archive_settings()
+        a["paused"] = True
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._set_archive_pause_button(True)
+        if self.archive_worker and self.archive_worker.isRunning():
+            self.archive_worker.pause()
+        else:
+            self.archive_status.setText("Downloads paused. Choose Resume downloads to continue.")
+
+    def _archive_resume(self):
+        a = self._archive_settings()
+        a["paused"] = False
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._set_archive_pause_button(False)
+        self.archive_status.setText("Downloads resumed.")
+        if self.archive_worker and self.archive_worker.isRunning():
+            self._resume_after_pause = True
+        else:
+            self._archive_tick()
+
+    def _archive_worker_stopped(self):
+        if self._archive_settings().get("paused", False):
+            self.archive_status.setText("Downloads paused. Choose Resume downloads to continue.")
+
+    def _archive_worker_finished(self):
+        if self._resume_after_pause and not self._archive_settings().get("paused", False):
+            self._resume_after_pause = False
+            QTimer.singleShot(0, self._archive_tick)
 
     def _archive_segment_done(self, vod_id: str, segment: int):
         a = self._archive_settings()

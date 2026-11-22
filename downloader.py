@@ -40,6 +40,7 @@ class Job:
     url: str
     preset: str = "Best quality"
     output_dir: str = str(DEFAULT_OUTPUT)
+    speed_limit_kbs: int = 0
     playlist: bool = False
     subtitles: bool = False
     embed_thumbnail: bool = True
@@ -77,6 +78,8 @@ class Job:
             *mgr.ensure_js_flag(),
             *extra,
         ]
+        if self.speed_limit_kbs > 0:
+            args += ["--limit-rate", str(self.speed_limit_kbs * 1000)]
         if self.resume:
             # reuse partial .part files / fragment caches from a failed run
             args += ["--continue", "--live-from-start",

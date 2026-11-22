@@ -179,6 +179,24 @@ def directory_size(path: Path) -> int:
     return total
 
 
+def stop_process_tree(process: subprocess.Popen | None) -> None:
+    if not process or process.poll() is not None:
+        return
+    try:
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
 class ArchiveDownloadWorker(QThread):
     changed = Signal(str, str, str)  # VOD id, state, message
     segment_done = Signal(str, int)
@@ -186,32 +204,35 @@ class ArchiveDownloadWorker(QThread):
     stopped = Signal()
 
     def __init__(self, vods: list[dict], output_root: str, start_time: str,
-                 end_time: str, max_gb: float, parent=None):
+                 end_time: str, max_gb: float, speed_limit_kbs: int = 0, parent=None):
         super().__init__(parent)
         self.vods = vods
         self.output_root = Path(output_root)
         self.start_time = start_time
         self.end_time = end_time
         self.max_bytes = max(0, int(max_gb * 1024**3))
+        self.speed_limit_kbs = max(0, int(speed_limit_kbs))
         self._cancel = False
+        self._pause_requested = False
         self._proc: subprocess.Popen | None = None
 
     def cancel(self):
         self._cancel = True
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.kill()
-            except OSError:
-                pass
+        stop_process_tree(self._proc)
+
+    def pause(self):
+        self._pause_requested = True
+        stop_process_tree(self._proc)
 
     def _wait_for_window(self) -> bool:
-        while not self._cancel and not schedule_open(self.start_time, self.end_time):
+        while (not self._cancel and not self._pause_requested
+               and not schedule_open(self.start_time, self.end_time)):
             self.progress.emit(f"Download window closed; resumes at {self.start_time}.")
             for _ in range(20):
-                if self._cancel:
+                if self._cancel or self._pause_requested:
                     return False
                 time.sleep(3)
-        return not self._cancel
+        return not self._cancel and not self._pause_requested
 
     def run(self):
         exe = mgr.ytdlp_path()
@@ -226,6 +247,8 @@ class ArchiveDownloadWorker(QThread):
         self.output_root.mkdir(parents=True, exist_ok=True)
         for vod in self.vods:
             if self._cancel:
+                break
+            if self._pause_requested:
                 break
             if vod.get("status") in ("done", "downloaded"):
                 continue
@@ -251,31 +274,36 @@ class ArchiveDownloadWorker(QThread):
                     break
                 start = segment * SEGMENT_SECONDS
                 finish = min(duration, start + SEGMENT_SECONDS)
-                template = str(folder / "%(title)s [%(id)s] [%(section_start)s].%(ext)s")
+                template = str(folder / f"Episode {segment + 1} - %(title)s [%(id)s].%(ext)s")
                 args = [str(exe), "--newline", "--continue", "--no-playlist",
                         "--download-sections",
                         f"*{format_timestamp(start)}-{format_timestamp(finish)}",
                         "--force-keyframes-at-cuts", "-f", "bv*+ba/b", "-o", template,
                         *mgr.ensure_ffmpeg_flag(), *mgr.ensure_js_flag(), vod["url"]]
+                if self.speed_limit_kbs:
+                    args[1:1] = ["--limit-rate", str(self.speed_limit_kbs * 1000)]
                 self.progress.emit(f"{vod['title']} — segment {segment + 1}/{count}")
                 try:
                     self._proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                                   stderr=subprocess.STDOUT, text=True,
                                                   encoding="utf-8", errors="replace",
                                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                    if self._cancel or self._pause_requested:
+                        stop_process_tree(self._proc)
                     last_size_check = time.monotonic()
-                    while self._proc.poll() is None and not self._cancel:
+                    while (self._proc.poll() is None and not self._cancel
+                           and not self._pause_requested):
                         now = time.monotonic()
                         if (self.max_bytes and now - last_size_check >= 30
                                 and directory_size(self.output_root) >= self.max_bytes):
-                            self._proc.kill()
+                            stop_process_tree(self._proc)
                             self._proc.wait()
                             failed = "Storage allowance reached"
                             break
                         if now - last_size_check >= 30:
                             last_size_check = now
                         if not schedule_open(self.start_time, self.end_time):
-                            self._proc.kill()
+                            stop_process_tree(self._proc)
                             self._proc.wait()
                             break
                         line = self._proc.stdout.readline() if self._proc.stdout else ""
@@ -287,7 +315,9 @@ class ArchiveDownloadWorker(QThread):
                     self._proc = None
                 except Exception as exc:
                     code, failed = 1, str(exc)
-                if self._cancel or not schedule_open(self.start_time, self.end_time):
+                if self._cancel or self._pause_requested:
+                    break
+                if not schedule_open(self.start_time, self.end_time):
                     break
                 if failed == "Storage allowance reached":
                     for candidate in self.vods:
@@ -301,6 +331,9 @@ class ArchiveDownloadWorker(QThread):
                 self.segment_done.emit(str(vod["id"]), segment)
             if self._cancel:
                 self.changed.emit(vod["id"], "paused", "Paused; incomplete segment will resume")
+                break
+            if self._pause_requested:
+                self.changed.emit(vod["id"], "paused", "Paused by you; resume to continue")
                 break
             if failed:
                 state = "storage-full" if failed == "Storage allowance reached" else "error"
