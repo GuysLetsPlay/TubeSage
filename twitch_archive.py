@@ -239,6 +239,7 @@ def stop_process_tree(process: subprocess.Popen | None) -> None:
 
 class ArchiveDownloadWorker(QThread):
     changed = Signal(str, str, str)  # VOD id, state, message
+    segment_started = Signal(str, int, int)  # VOD id, zero-based segment, total segments
     segment_done = Signal(str, int)
     progress = Signal(str)
     stopped = Signal()
@@ -301,7 +302,12 @@ class ArchiveDownloadWorker(QThread):
             count = max(1, (duration + SEGMENT_SECONDS - 1) // SEGMENT_SECONDS)
             self.changed.emit(vod["id"], "downloading", "Downloading six-hour segments")
             failed = ""
-            for segment in range(count):
+            segment_order = list(range(count))
+            priority_segment = vod.get("priority_segment")
+            if isinstance(priority_segment, int) and 0 <= priority_segment < count:
+                segment_order.remove(priority_segment)
+                segment_order.insert(0, priority_segment)
+            for segment in segment_order:
                 if self._cancel or not self._wait_for_window():
                     break
                 if segment in vod.get("segments_done", []) or segment in vod.get("segments_uploaded", []):
@@ -320,6 +326,7 @@ class ArchiveDownloadWorker(QThread):
                 if self.speed_limit_kbs:
                     args[1:1] = ["--limit-rate", str(self.speed_limit_kbs * 1000)]
                 self.progress.emit(f"{vod['title']} — segment {segment + 1}/{count}")
+                self.segment_started.emit(str(vod["id"]), segment, count)
                 try:
                     self._proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                                   stderr=subprocess.STDOUT, text=True,

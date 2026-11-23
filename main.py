@@ -1114,6 +1114,10 @@ class MainWindow(QMainWindow):
         archive_actions.addWidget(open_studio)
         archive_actions.addStretch(1)
         al.addLayout(archive_actions)
+        self.archive_current = QLabel("Current download: no segment is active.")
+        self.archive_current.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.archive_current.setWordWrap(True)
+        al.addWidget(self.archive_current)
         self.archive_status = QLabel("No Twitch archive search yet.")
         self.archive_status.setWordWrap(True)
         al.addWidget(self.archive_status)
@@ -1240,10 +1244,15 @@ class MainWindow(QMainWindow):
             if vod.get("status") == "done":
                 done.update(range(count))
                 uploaded.update(range(count))
+            partial_segments = []
             for segment in range(count):
                 files = twitch_archive.segment_files(folder, vod, segment)
                 if any(not path.name.endswith((".part", ".ytdl")) for path in files):
                     done.add(segment)
+                if any(path.name.endswith(".part") for path in files):
+                    partial_segments.append(segment)
+            if partial_segments and vod.get("status") in ("downloading", "paused"):
+                vod["current_segment"] = partial_segments[0]
             vod["segments_done"] = sorted(done)
             vod["segments_uploaded"] = sorted(uploaded)
             if vod.get("status") == "downloading":
@@ -1370,6 +1379,10 @@ class MainWindow(QMainWindow):
             done = {int(i) for i in vod.get("segments_done", [])}
             count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
                            + twitch_archive.SEGMENT_SECONDS - 1) // twitch_archive.SEGMENT_SECONDS)
+            current_segment = vod.get("current_segment")
+            if status in ("downloading", "paused") and isinstance(current_segment, int):
+                prefix = "Downloading" if status == "downloading" else "Paused at"
+                status_label = f"{prefix} E{current_segment + 1}/{count}"
             parent = QTreeWidgetItem([str(vod.get("title", "")), str(vod.get("date", "")),
                                       status_label, f"{len(done)}/{count} segments downloaded",
                                       details or "Segments"])
@@ -1389,6 +1402,8 @@ class MainWindow(QMainWindow):
                 if downloaded:
                     done.add(segment)
                 label = f"E{segment + 1}"
+                if status in ("downloading", "paused") and current_segment == segment:
+                    label += " - DOWNLOADING NOW" if status == "downloading" else " - PAUSED HERE"
                 label += f" - {files[0].name}" if files else " - not downloaded"
                 child = QTreeWidgetItem([label, "", "", "", ""])
                 child.setData(0, Qt.UserRole, vod_id)
@@ -1410,16 +1425,42 @@ class MainWindow(QMainWindow):
                     lambda checked, vid=vod_id, seg=segment: self._archive_set_segment_uploaded(
                         vid, seg, checked))
                 self.archive_table.setItemWidget(child, 3, uploaded_box)
+                actions = QWidget(self.archive_table)
+                actions_layout = QHBoxLayout(actions)
+                actions_layout.setContentsMargins(2, 0, 2, 0)
+                next_button = QPushButton("Download next")
+                next_button.setToolTip("Pause current segment, then prioritize this segment")
+                next_button.setEnabled(segment not in done and segment not in uploaded)
+                next_button.clicked.connect(
+                    lambda _checked=False, vid=vod_id, seg=segment:
+                    self._archive_queue_segment(vid, seg))
+                actions_layout.addWidget(next_button)
                 delete_button = QPushButton("Delete")
                 delete_button.setEnabled(self.archive_worker is None
                                          or not self.archive_worker.isRunning())
                 delete_button.clicked.connect(
                     lambda _checked=False, vid=vod_id, seg=segment:
                     self._archive_delete_segment(vid, seg))
-                self.archive_table.setItemWidget(child, 4, delete_button)
+                actions_layout.addWidget(delete_button)
+                self.archive_table.setItemWidget(child, 4, actions)
             vod["segments_done"] = sorted(done)
             parent.setExpanded(vod_id in expanded)
         self.archive_table.blockSignals(False)
+        active = next((v for v in vods if v.get("status") == "downloading"
+                       and isinstance(v.get("current_segment"), int)), None)
+        if active is None:
+            active = next((v for v in vods if v.get("status") == "paused"
+                           and isinstance(v.get("current_segment"), int)), None)
+        if active:
+            segment = active["current_segment"]
+            total = max(1, (int(active.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                            + twitch_archive.SEGMENT_SECONDS - 1) // twitch_archive.SEGMENT_SECONDS)
+            verb = "Downloading" if active.get("status") == "downloading" else "Paused at"
+            self.archive_current.setText(
+                f"{verb}: {active.get('title', '')} ({active.get('date', '')}) - "
+                f"E{segment + 1}/{total} - Twitch VOD ID {str(active.get('id', '')).removeprefix('v')}")
+        else:
+            self.archive_current.setText("Current download: no segment is active.")
 
     def _archive_item_changed(self, item):
         if item.column() != 0 or item.parent() is not None:
@@ -1574,6 +1615,31 @@ class MainWindow(QMainWindow):
         self._save_archive_settings()
         self._refresh_archive_table()
 
+    def _archive_queue_segment(self, vod_id: str, segment: int):
+        a = self._archive_settings()
+        vod = next((v for v in a.get("vods", []) if str(v.get("id")) == str(vod_id)), None)
+        if not vod:
+            return
+        done = {int(i) for i in vod.get("segments_done", [])}
+        uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
+        if segment in done or segment in uploaded:
+            return
+        a["next_segment"] = {"vod_id": str(vod_id), "segment": int(segment)}
+        vod["selected"] = True
+        if vod.get("status") in ("found", "error", "storage-full", "live"):
+            vod["status"] = "queued"
+            vod["error"] = ""
+        a["paused"] = False
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._set_archive_pause_button(False)
+        self.archive_status.setText(f"Queued E{segment + 1} as the next segment.")
+        if self.archive_worker and self.archive_worker.isRunning():
+            self._resume_after_pause = True
+            self.archive_worker.pause()
+        else:
+            self._archive_tick()
+
     def _archive_tick(self):
         if self.archive_worker and self.archive_worker.isRunning():
             return
@@ -1585,12 +1651,20 @@ class MainWindow(QMainWindow):
                    and v.get("status") not in ("live", "error")]
         if not pending:
             return
+        priority = a.get("next_segment")
+        if isinstance(priority, dict) and isinstance(priority.get("segment"), int):
+            priority_id = str(priority.get("vod_id", ""))
+            for vod in pending:
+                if str(vod.get("id")) == priority_id:
+                    vod["priority_segment"] = int(priority["segment"])
+            pending.sort(key=lambda vod: str(vod.get("id")) != priority_id)
         self._save_archive_settings()
         a = self._archive_settings()
         self.archive_worker = ArchiveDownloadWorker(
             pending, a["output_dir"], a["start_time"], a["end_time"],
             float(a["max_gb"]), int(SETTINGS.get("download_speed_limit_kbs", 0)), self)
         self.archive_worker.progress.connect(self.archive_status.setText)
+        self.archive_worker.segment_started.connect(self._archive_segment_started)
         self.archive_worker.changed.connect(self._archive_state_changed)
         self.archive_worker.segment_done.connect(self._archive_segment_done)
         self.archive_worker.stopped.connect(self._archive_worker_stopped)
@@ -1640,6 +1714,23 @@ class MainWindow(QMainWindow):
                 done = set(vod.get("segments_done", []))
                 done.add(int(segment))
                 vod["segments_done"] = sorted(done)
+                if vod.get("current_segment") == int(segment):
+                    vod.pop("current_segment", None)
+                priority = a.get("next_segment")
+                if (isinstance(priority, dict) and str(priority.get("vod_id")) == str(vod_id)
+                        and int(priority.get("segment", -1)) == int(segment)):
+                    a.pop("next_segment", None)
+                break
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self._refresh_archive_table()
+
+    def _archive_segment_started(self, vod_id: str, segment: int, total: int):
+        a = self._archive_settings()
+        for vod in a.get("vods", []):
+            if str(vod.get("id")) == str(vod_id):
+                vod["current_segment"] = int(segment)
+                vod["status"] = "downloading"
                 break
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
