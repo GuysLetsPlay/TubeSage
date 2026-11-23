@@ -44,6 +44,39 @@ def segment_files(folder: Path, vod: dict, segment: int) -> list[Path]:
         return []
 
 
+def add_stream_id_to_segment_names(folder: Path, vod: dict) -> None:
+    """Add the Helix broadcast ID to existing names without changing file data.
+
+    Partial files are renamed as well, using the same basename yt-dlp will use
+    on resume. Callers must ensure yt-dlp is not currently writing this VOD.
+    """
+    stream_id = str(vod.get("stream_id") or "").strip()
+    if not stream_id:
+        return
+    marker = f"[Stream ID {stream_id}]"
+    for segment in range(max(1, (int(vod.get("duration") or SEGMENT_SECONDS)
+                              + SEGMENT_SECONDS - 1) // SEGMENT_SECONDS)):
+        for path in segment_files(folder, vod, segment):
+            if marker in path.name:
+                continue
+            suffix = ""
+            base = path.name
+            for ending in (".part", ".ytdl"):
+                if base.endswith(ending):
+                    suffix = ending + suffix
+                    base = base[:-len(ending)]
+            media_ext = Path(base).suffix
+            if not media_ext:
+                continue
+            target = path.with_name(f"{base[:-len(media_ext)]} {marker}{media_ext}{suffix}")
+            if target.exists():
+                continue
+            try:
+                path.rename(target)
+            except OSError:
+                pass
+
+
 def migrate_legacy_segment_names(folder: Path, vod: dict) -> None:
     """Rename old Episode N outputs so yt-dlp can resume under the E<N> template."""
     vod_id = str(vod.get("id", ""))
@@ -317,7 +350,9 @@ class ArchiveDownloadWorker(QThread):
                     break
                 start = segment * SEGMENT_SECONDS
                 finish = min(duration, start + SEGMENT_SECONDS)
-                template = str(folder / f"E{segment + 1} - %(title)s [VOD ID {str(vod['id']).removeprefix('v')}].%(ext)s")
+                stream_marker = (f" [Stream ID {safe_name(str(vod['stream_id']))}]"
+                                 if vod.get("stream_id") else "")
+                template = str(folder / f"E{segment + 1} - %(title)s [VOD ID {str(vod['id']).removeprefix('v')}]{stream_marker}.%(ext)s")
                 args = [str(exe), "--newline", "--continue", "--no-playlist",
                         "--download-sections",
                         f"*{format_timestamp(start)}-{format_timestamp(finish)}",

@@ -36,6 +36,7 @@ import error_doctor
 import knowledge
 import ytdlp_manager as mgr
 import twitch_archive
+import twitch_api
 from downloader import DownloadWorker, Job, MetaWorker
 from twitch_archive import ArchiveDownloadWorker, VodSearchWorker
 
@@ -422,6 +423,8 @@ class MainWindow(QMainWindow):
         self.meta_worker: MetaWorker | None = None
         self.archive_search: VodSearchWorker | None = None
         self.archive_worker: ArchiveDownloadWorker | None = None
+        self.twitch_auth_worker: twitch_api.DeviceAuthorizationWorker | None = None
+        self.twitch_metadata_worker: twitch_api.VideoMetadataWorker | None = None
         self._resume_after_pause = False
         self.archive_timer = QTimer(self)
         self.archive_timer.setInterval(30_000)
@@ -1036,6 +1039,19 @@ class MainWindow(QMainWindow):
         archive = QGroupBox("Twitch VOD archive → YouTube Studio")
         al = QVBoxLayout(archive)
         archive_form = QFormLayout()
+        self.twitch_client_id = QLineEdit(SETTINGS.get("twitch_client_id", twitch_api.DEFAULT_CLIENT_ID))
+        self.twitch_client_id.setPlaceholderText("Twitch application Client ID")
+        self.twitch_client_id.setMaximumWidth(420)
+        auth_row = QHBoxLayout()
+        auth_row.addWidget(self.twitch_client_id)
+        self.twitch_connect_button = QPushButton("Connect Twitch")
+        self.twitch_connect_button.clicked.connect(self._twitch_connect)
+        auth_row.addWidget(self.twitch_connect_button)
+        self.twitch_auth_status = QLabel()
+        self.twitch_auth_status.setWordWrap(True)
+        auth_row.addWidget(self.twitch_auth_status, 1)
+        archive_form.addRow("Twitch API:", auth_row)
+
         self.archive_streamer = QLineEdit()
         self.archive_streamer.setPlaceholderText("Twitch channel login, for example trimax")
         archive_form.addRow("Twitch streamer:", self.archive_streamer)
@@ -1184,6 +1200,7 @@ class MainWindow(QMainWindow):
             else "ffmpeg: not installed (needed for high-quality merging & MP3)")
 
     def _save_all(self):
+        SETTINGS["twitch_client_id"] = self.twitch_client_id.text().strip()
         SETTINGS["cli_agent"] = self.agent_combo.currentText()
         SETTINGS["tg_group"] = self.tg_edit.text().strip() or "YTDLNIS"
         SETTINGS["tg_topic"] = self.tg_topic_edit.text().strip() or "general"
@@ -1205,6 +1222,83 @@ class MainWindow(QMainWindow):
         save_settings(SETTINGS)
 
     # ------------------------------------------------ Twitch archive ----
+    def _twitch_connect(self):
+        client_id = self.twitch_client_id.text().strip()
+        if not client_id:
+            self.twitch_auth_status.setText("Enter the Client ID from your Twitch Developer app.")
+            return
+        SETTINGS["twitch_client_id"] = client_id
+        save_settings(SETTINGS)
+        self.twitch_connect_button.setEnabled(False)
+        self.twitch_auth_status.setText("Starting Twitch authorization…")
+        self.twitch_auth_worker = twitch_api.DeviceAuthorizationWorker(client_id, self)
+        self.twitch_auth_worker.authorization_ready.connect(self._twitch_authorization_ready)
+        self.twitch_auth_worker.status.connect(self.twitch_auth_status.setText)
+        self.twitch_auth_worker.connected.connect(self._twitch_connected)
+        self.twitch_auth_worker.failed.connect(self._twitch_auth_failed)
+        self.twitch_auth_worker.finished.connect(lambda: self.twitch_connect_button.setEnabled(True))
+        self.twitch_auth_worker.start()
+
+    def _twitch_authorization_ready(self, url: str, code: str):
+        webbrowser.open(url)
+        QMessageBox.information(self, "Connect Twitch",
+                                f"Twitch authorization opened in your browser.\n\n"
+                                f"If prompted, enter this code:\n{code}")
+
+    def _twitch_connected(self, refresh_token: str):
+        try:
+            twitch_api.save_refresh_token(twitch_api.protect_token(refresh_token))
+            save_settings(SETTINGS)
+            self.twitch_auth_status.setText("Connected to Twitch. Looking up stream IDs…")
+            self._resolve_stream_ids()
+        except Exception as exc:
+            self.twitch_auth_status.setText(f"Could not securely save Twitch authorization: {exc}")
+
+    def _twitch_auth_failed(self, error: str):
+        self.twitch_auth_status.setText(f"Twitch connection failed: {error}")
+
+    def _resolve_stream_ids(self, allow_retry: bool = True):
+        token = twitch_api.load_refresh_token()
+        if not token or (self.twitch_metadata_worker and self.twitch_metadata_worker.isRunning()):
+            return
+        missing = [str(v.get("id")) for v in self._archive_settings().get("vods", [])
+                   if v.get("id") and not v.get("stream_id")]
+        if not missing:
+            self.twitch_auth_status.setText("Connected to Twitch. Stream IDs are up to date.")
+            return
+        worker = twitch_api.VideoMetadataWorker(
+            self.twitch_client_id.text().strip() or twitch_api.DEFAULT_CLIENT_ID, token, missing, self)
+        self.twitch_metadata_worker = worker
+        worker.found.connect(self._twitch_stream_ids_found)
+        worker.failed.connect(lambda error: self._twitch_metadata_failed(error, allow_retry))
+        worker.finished.connect(self._twitch_metadata_finished)
+        worker.start()
+
+    def _twitch_metadata_finished(self):
+        self._refresh_archive_table()
+        QTimer.singleShot(0, self._archive_tick)
+
+    def _twitch_stream_ids_found(self, results: dict):
+        a = self._archive_settings()
+        for vod in a.get("vods", []):
+            stream_id = results.get(f"v{str(vod.get('id', '')).removeprefix('v')}")
+            if stream_id:
+                vod["stream_id"] = stream_id
+                if not (self.archive_worker and self.archive_worker.isRunning()):
+                    folder = twitch_archive.vod_folder(a.get("output_dir", ""), vod)
+                    twitch_archive.add_stream_id_to_segment_names(folder, vod)
+        SETTINGS["twitch_archive"] = a
+        save_settings(SETTINGS)
+        self.twitch_auth_status.setText(f"Connected to Twitch. Found stream IDs for {len(results)} VODs.")
+        self._refresh_archive_table()
+
+    def _twitch_metadata_failed(self, error: str, allow_retry: bool):
+        self.twitch_auth_status.setText(f"Twitch stream ID lookup failed: {error}")
+        # Rotating refresh tokens can be lost only if persistence itself fails;
+        # never loop immediately after an API/authentication failure.
+        if self.archive_worker is None or not self.archive_worker.isRunning():
+            self._archive_tick()
+
     def _archive_defaults(self) -> dict:
         today = QDate.currentDate()
         return {
@@ -1276,6 +1370,12 @@ class MainWindow(QMainWindow):
         self.archive_limit.setValue(float(a.get("max_gb", 500)))
         self._set_archive_pause_button(bool(a.get("paused", False)))
         self.archive_auto_refresh.setChecked(bool(a.get("auto_refresh", True)))
+        self.twitch_client_id.setText(SETTINGS.get("twitch_client_id", twitch_api.DEFAULT_CLIENT_ID))
+        self.twitch_auth_status.setText(
+            "Connected to Twitch." if twitch_api.load_refresh_token()
+            else "Not connected. Stream IDs are optional, but Twitch authorization enables them.")
+        if twitch_api.load_refresh_token():
+            QTimer.singleShot(1200, self._resolve_stream_ids)
 
     def _save_archive_settings(self):
         a = self._archive_settings()
@@ -1345,6 +1445,8 @@ class MainWindow(QMainWindow):
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
         self._refresh_archive_table()
+        if twitch_api.load_refresh_token():
+            self._resolve_stream_ids()
         self.archive_status.setText(
             f"Found {len(found)} VODs in this date selection; {added} new. "
             "Select the recordings you want, then choose Download selected.")
@@ -1376,6 +1478,7 @@ class MainWindow(QMainWindow):
             elif status == "done":
                 details = "All segments uploaded"
             vod_id = str(vod.get("id", ""))
+            stream_id = str(vod.get("stream_id", ""))
             done = {int(i) for i in vod.get("segments_done", [])}
             count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
                            + twitch_archive.SEGMENT_SECONDS - 1) // twitch_archive.SEGMENT_SECONDS)
@@ -1383,7 +1486,10 @@ class MainWindow(QMainWindow):
             if status in ("downloading", "paused") and isinstance(current_segment, int):
                 prefix = "Downloading" if status == "downloading" else "Paused at"
                 status_label = f"{prefix} E{current_segment + 1}/{count}"
-            parent = QTreeWidgetItem([str(vod.get("title", "")), str(vod.get("date", "")),
+            title_label = f"{vod.get('title', '')} [VOD ID {vod_id}]"
+            if stream_id:
+                title_label += f" [Stream ID {stream_id}]"
+            parent = QTreeWidgetItem([title_label, str(vod.get("date", "")),
                                       status_label, f"{len(done)}/{count} segments downloaded",
                                       details or "Segments"])
             parent.setData(0, Qt.UserRole, vod_id)
@@ -1391,7 +1497,11 @@ class MainWindow(QMainWindow):
             default_selected = status in ("queued", "paused", "found")
             parent.setCheckState(0, Qt.Checked if vod.get("selected", default_selected)
                                  else Qt.Unchecked)
-            parent.setToolTip(0, vod.get("url", ""))
+            parent.setToolTip(0, f"{vod.get('url', '')}\nVOD ID {vod_id} · "
+                                 f"Stream ID {stream_id or 'not resolved'}")
+            if stream_id:
+                details = f"{details} · Stream ID {stream_id}" if details else f"Stream ID {stream_id}"
+                parent.setText(4, details)
             self.archive_table.addTopLevelItem(parent)
             folder = twitch_archive.vod_folder(self._archive_settings().get("output_dir", ""), vod)
             uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
@@ -1643,6 +1753,8 @@ class MainWindow(QMainWindow):
     def _archive_tick(self):
         if self.archive_worker and self.archive_worker.isRunning():
             return
+        if self.twitch_metadata_worker and self.twitch_metadata_worker.isRunning():
+            return
         a = self._archive_settings()
         if a.get("paused", False):
             return
@@ -1703,9 +1815,17 @@ class MainWindow(QMainWindow):
             self.archive_status.setText("Downloads paused. Choose Resume downloads to continue.")
 
     def _archive_worker_finished(self):
+        self._rename_stream_id_segments()
         if self._resume_after_pause and not self._archive_settings().get("paused", False):
             self._resume_after_pause = False
             QTimer.singleShot(0, self._archive_tick)
+
+    def _rename_stream_id_segments(self):
+        a = self._archive_settings()
+        for vod in a.get("vods", []):
+            if vod.get("stream_id"):
+                twitch_archive.add_stream_id_to_segment_names(
+                    twitch_archive.vod_folder(a.get("output_dir", ""), vod), vod)
 
     def _archive_segment_done(self, vod_id: str, segment: int):
         a = self._archive_settings()
