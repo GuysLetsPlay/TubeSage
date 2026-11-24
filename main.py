@@ -1386,6 +1386,8 @@ class MainWindow(QMainWindow):
             vod.setdefault("segments_uploaded", [])
             folder = twitch_archive.vod_folder(a.get("output_dir", ""), vod)
             twitch_archive.migrate_legacy_segment_names(folder, vod)
+            if vod.get("stream_id"):
+                twitch_archive.add_stream_id_to_segment_names(folder, vod)
             done = {int(i) for i in vod.get("segments_done", [])}
             uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
             count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)

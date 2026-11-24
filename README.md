@@ -30,7 +30,9 @@ only download it from this repository's Releases page.
   TubeSage lists matching VODs and refreshes automatically; check the recordings
   to download in six-hour files during your chosen time window, up to the
   configured storage allowance, with pause/resume, a download speed limit, and
-  per-VOD files named E1, E2, and so on, with the Twitch VOD ID in each filename
+  per-VOD files named E1, E2, and so on; segment filenames fit YouTube's
+  100-character title limit by shortening the middle of long Twitch titles while
+  preserving the episode prefix and Twitch VOD/Stream ID suffixes
 - Expand each VOD to track downloaded and uploaded status per segment, see the
   active VOD and segment, prioritize a segment next, and delete individual files
 - Segment filenames include the numeric Twitch VOD ID for direct Twitch lookup

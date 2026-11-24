@@ -15,9 +15,33 @@ from PySide6.QtCore import QThread, Signal
 import ytdlp_manager as mgr
 
 SEGMENT_SECONDS = 6 * 60 * 60
-def safe_name(value: str) -> str:
+YOUTUBE_TITLE_LIMIT = 100
+
+
+def clean_filename_component(value: str) -> str:
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value or "VOD")
-    return re.sub(r"\s+", " ", value).strip(" .")[:100] or "VOD"
+    return re.sub(r"\s+", " ", value).strip(" .") or "VOD"
+
+
+def safe_name(value: str) -> str:
+    return clean_filename_component(value)[:100] or "VOD"
+
+
+def segment_title_stem(vod: dict, segment: int) -> str:
+    """Build a YouTube-ready filename title, preserving both ID markers."""
+    prefix = f"E{segment + 1} - "
+    numeric_vod_id = str(vod.get("id", "")).removeprefix("v")
+    suffix = f" [VOD ID {numeric_vod_id}]"
+    if vod.get("stream_id"):
+        suffix += f" [Stream ID {clean_filename_component(str(vod['stream_id']))}]"
+    title = clean_filename_component(str(vod.get("title", "VOD")))
+    available = YOUTUBE_TITLE_LIMIT - len(prefix) - len(suffix)
+    if len(title) > available:
+        keep = max(0, available - 3)
+        front = (keep + 1) // 2
+        back = keep - front
+        title = title[:front] + "..." + (title[-back:] if back else "")
+    return f"{prefix}{title}{suffix}"
 
 
 def format_timestamp(seconds: int) -> str:
@@ -45,20 +69,14 @@ def segment_files(folder: Path, vod: dict, segment: int) -> list[Path]:
 
 
 def add_stream_id_to_segment_names(folder: Path, vod: dict) -> None:
-    """Add the Helix broadcast ID to existing names without changing file data.
+    """Normalize existing files to the 100-character segment naming format.
 
     Partial files are renamed as well, using the same basename yt-dlp will use
     on resume. Callers must ensure yt-dlp is not currently writing this VOD.
     """
-    stream_id = str(vod.get("stream_id") or "").strip()
-    if not stream_id:
-        return
-    marker = f"[Stream ID {stream_id}]"
     for segment in range(max(1, (int(vod.get("duration") or SEGMENT_SECONDS)
                               + SEGMENT_SECONDS - 1) // SEGMENT_SECONDS)):
         for path in segment_files(folder, vod, segment):
-            if marker in path.name:
-                continue
             suffix = ""
             base = path.name
             for ending in (".part", ".ytdl"):
@@ -68,7 +86,9 @@ def add_stream_id_to_segment_names(folder: Path, vod: dict) -> None:
             media_ext = Path(base).suffix
             if not media_ext:
                 continue
-            target = path.with_name(f"{base[:-len(media_ext)]} {marker}{media_ext}{suffix}")
+            target = path.with_name(f"{segment_title_stem(vod, segment)}{media_ext}{suffix}")
+            if target == path:
+                continue
             if target.exists():
                 continue
             try:
@@ -350,9 +370,8 @@ class ArchiveDownloadWorker(QThread):
                     break
                 start = segment * SEGMENT_SECONDS
                 finish = min(duration, start + SEGMENT_SECONDS)
-                stream_marker = (f" [Stream ID {safe_name(str(vod['stream_id']))}]"
-                                 if vod.get("stream_id") else "")
-                template = str(folder / f"E{segment + 1} - %(title)s [VOD ID {str(vod['id']).removeprefix('v')}]{stream_marker}.%(ext)s")
+                filename_title = segment_title_stem(vod, segment).replace("%", "%%")
+                template = str(folder / f"{filename_title}.%(ext)s")
                 args = [str(exe), "--newline", "--continue", "--no-playlist",
                         "--download-sections",
                         f"*{format_timestamp(start)}-{format_timestamp(finish)}",
