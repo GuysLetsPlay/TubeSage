@@ -1341,7 +1341,7 @@ class MainWindow(QMainWindow):
                 vod["stream_id"] = stream_id
                 if not (self.archive_worker and self.archive_worker.isRunning()):
                     folder = twitch_archive.vod_folder(a.get("output_dir", ""), vod)
-                    twitch_archive.add_stream_id_to_segment_names(folder, vod)
+                    twitch_archive.normalize_segment_names(folder, vod)
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
         self.twitch_auth_status.setText(f"Connected to Twitch. Found stream IDs for {len(results)} VODs.")
@@ -1386,8 +1386,7 @@ class MainWindow(QMainWindow):
             vod.setdefault("segments_uploaded", [])
             folder = twitch_archive.vod_folder(a.get("output_dir", ""), vod)
             twitch_archive.migrate_legacy_segment_names(folder, vod)
-            if vod.get("stream_id"):
-                twitch_archive.add_stream_id_to_segment_names(folder, vod)
+            twitch_archive.normalize_segment_names(folder, vod)
             done = {int(i) for i in vod.get("segments_done", [])}
             uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
             count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
@@ -1548,9 +1547,9 @@ class MainWindow(QMainWindow):
             if status in ("downloading", "paused") and isinstance(current_segment, int):
                 prefix = "Downloading" if status == "downloading" else "Paused at"
                 status_label = f"{prefix} E{current_segment + 1}/{count}"
-            title_label = f"{vod.get('title', '')} [VOD ID {vod_id}]"
+            title_label = f"{vod.get('title', '')} · VOD ID {vod_id}"
             if stream_id:
-                title_label += f" [Stream ID {stream_id}]"
+                title_label += f" · Stream ID {stream_id}"
             parent = QTreeWidgetItem([title_label, str(vod.get("date", "")),
                                       status_label, f"{len(done)}/{count} segments downloaded",
                                       details or "Segments"])
@@ -1885,9 +1884,8 @@ class MainWindow(QMainWindow):
     def _rename_stream_id_segments(self):
         a = self._archive_settings()
         for vod in a.get("vods", []):
-            if vod.get("stream_id"):
-                twitch_archive.add_stream_id_to_segment_names(
-                    twitch_archive.vod_folder(a.get("output_dir", ""), vod), vod)
+            twitch_archive.normalize_segment_names(
+                twitch_archive.vod_folder(a.get("output_dir", ""), vod), vod)
 
     def _archive_segment_done(self, vod_id: str, segment: int):
         a = self._archive_settings()

@@ -31,9 +31,9 @@ def segment_title_stem(vod: dict, segment: int) -> str:
     """Build a YouTube-ready filename title, preserving both ID markers."""
     prefix = f"E{segment + 1} - "
     numeric_vod_id = str(vod.get("id", "")).removeprefix("v")
-    suffix = f" [VOD ID {numeric_vod_id}]"
+    suffix = f" VOD ID {numeric_vod_id}"
     if vod.get("stream_id"):
-        suffix += f" [Stream ID {clean_filename_component(str(vod['stream_id']))}]"
+        suffix += f" Stream ID {clean_filename_component(str(vod['stream_id']))}"
     title = clean_filename_component(str(vod.get("title", "VOD")))
     available = YOUTUBE_TITLE_LIMIT - len(prefix) - len(suffix)
     if len(title) > available:
@@ -59,7 +59,7 @@ def segment_files(folder: Path, vod: dict, segment: int) -> list[Path]:
     vod_id = str(vod.get("id", ""))
     prefixes = (f"E{segment + 1} - ", f"Episode {segment + 1} - ")
     numeric_id = vod_id.removeprefix("v")
-    markers = (f"[{vod_id}]", f"[VOD ID {numeric_id}]")
+    markers = (f"[{vod_id}]", f"[VOD ID {numeric_id}]", f"VOD ID {numeric_id}")
     try:
         return [path for path in folder.iterdir()
                 if path.is_file() and path.name.startswith(prefixes)
@@ -68,7 +68,7 @@ def segment_files(folder: Path, vod: dict, segment: int) -> list[Path]:
         return []
 
 
-def add_stream_id_to_segment_names(folder: Path, vod: dict) -> None:
+def normalize_segment_names(folder: Path, vod: dict) -> None:
     """Normalize existing files to the 100-character segment naming format.
 
     Partial files are renamed as well, using the same basename yt-dlp will use
@@ -113,7 +113,7 @@ def migrate_legacy_segment_names(folder: Path, vod: dict) -> None:
         match = re.match(r"^(?:Episode |E)(\d+) - (.+)$", path.name)
         if not match:
             continue
-        suffix = f"[VOD ID {vod_id.removeprefix('v')}]"
+        suffix = f"VOD ID {vod_id.removeprefix('v')}"
         body = re.sub(marker + r"(?=\.)", suffix, match.group(2))
         target = path.with_name(f"E{match.group(1)} - {body}")
         if not target.exists():
