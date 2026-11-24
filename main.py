@@ -32,6 +32,7 @@ from PySide6.QtWidgets import QScrollArea
 
 from app_paths import DATA_DIR
 import downloader
+import app_updater
 import error_doctor
 import knowledge
 import ytdlp_manager as mgr
@@ -425,6 +426,7 @@ class MainWindow(QMainWindow):
         self.archive_worker: ArchiveDownloadWorker | None = None
         self.twitch_auth_worker: twitch_api.DeviceAuthorizationWorker | None = None
         self.twitch_metadata_worker: twitch_api.VideoMetadataWorker | None = None
+        self.update_worker: app_updater.UpdateWorker | None = None
         self._resume_after_pause = False
         self.archive_timer = QTimer(self)
         self.archive_timer.setInterval(30_000)
@@ -1036,6 +1038,21 @@ class MainWindow(QMainWindow):
         el.addLayout(row)
         lay.addWidget(eng)
 
+        updates = QGroupBox(f"TubeSage updates · current version {app_updater.APP_VERSION}")
+        ul = QHBoxLayout(updates)
+        self.update_button = QPushButton("Check for updates")
+        self.update_button.clicked.connect(self._check_for_updates)
+        ul.addWidget(self.update_button)
+        self.install_update_button = QPushButton("Install and restart")
+        self.install_update_button.setVisible(False)
+        self.install_update_button.clicked.connect(self._install_downloaded_update)
+        ul.addWidget(self.install_update_button)
+        self._pending_update_installer = ""
+        self.update_status = QLabel("Updates install in your user profile and don’t need administrator approval.")
+        self.update_status.setWordWrap(True)
+        ul.addWidget(self.update_status, 1)
+        lay.addWidget(updates)
+
         archive = QGroupBox("Twitch VOD archive → YouTube Studio")
         al = QVBoxLayout(archive)
         archive_form = QFormLayout()
@@ -1217,6 +1234,40 @@ class MainWindow(QMainWindow):
             self.archive_scan_timer.stop()
         self.statusBar().showMessage("Settings saved.", 4000)
 
+    def _check_for_updates(self):
+        if self.update_worker and self.update_worker.isRunning():
+            return
+        self.update_button.setEnabled(False)
+        self.update_worker = app_updater.UpdateWorker(self)
+        self.update_worker.progress.connect(self.update_status.setText)
+        self.update_worker.up_to_date.connect(self._update_up_to_date)
+        self.update_worker.downloaded.connect(self._update_downloaded)
+        self.update_worker.failed.connect(self._update_failed)
+        self.update_worker.finished.connect(lambda: self.update_button.setEnabled(True))
+        self.update_worker.start()
+
+    def _update_up_to_date(self, version: str):
+        self.update_status.setText(f"TubeSage {version} is the latest version.")
+
+    def _update_failed(self, error: str):
+        self.update_status.setText(f"Update check failed: {error}")
+
+    def _update_downloaded(self, installer_path: str, version: str):
+        self._pending_update_installer = installer_path
+        self.install_update_button.setVisible(True)
+        self.update_status.setText(f"TubeSage {version} is downloaded and ready to install.")
+
+    def _install_downloaded_update(self):
+        if not self._pending_update_installer:
+            return
+        target_app = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Programs" / "TubeSage" / "TubeSage.exe"
+        try:
+            app_updater.launch_installer_after_exit(self._pending_update_installer, str(target_app))
+            self.update_status.setText("Installing the update…")
+            self.close()
+        except Exception as exc:
+            QMessageBox.warning(self, "TubeSage update", f"Could not start the installer: {exc}")
+
     def _save_speed_limit(self, value: int):
         SETTINGS["download_speed_limit_kbs"] = int(value)
         save_settings(SETTINGS)
@@ -1255,7 +1306,11 @@ class MainWindow(QMainWindow):
             self.twitch_auth_status.setText(f"Could not securely save Twitch authorization: {exc}")
 
     def _twitch_auth_failed(self, error: str):
-        self.twitch_auth_status.setText(f"Twitch connection failed: {error}")
+        if "invalid client" in error.lower():
+            self.twitch_auth_status.setText(
+                "Twitch rejected this Client ID. Copy the ID from your Twitch Developer Console and retry.")
+        else:
+            self.twitch_auth_status.setText(f"Twitch connection failed: {error}")
 
     def _resolve_stream_ids(self, allow_retry: bool = True):
         token = twitch_api.load_refresh_token()
@@ -1370,7 +1425,12 @@ class MainWindow(QMainWindow):
         self.archive_limit.setValue(float(a.get("max_gb", 500)))
         self._set_archive_pause_button(bool(a.get("paused", False)))
         self.archive_auto_refresh.setChecked(bool(a.get("auto_refresh", True)))
-        self.twitch_client_id.setText(SETTINGS.get("twitch_client_id", twitch_api.DEFAULT_CLIENT_ID))
+        saved_client_id = SETTINGS.get("twitch_client_id", "")
+        if saved_client_id in ("", "95litvelyd4mlshypb9pakhhzm0vyh"):
+            saved_client_id = twitch_api.DEFAULT_CLIENT_ID
+            SETTINGS["twitch_client_id"] = saved_client_id
+            save_settings(SETTINGS)
+        self.twitch_client_id.setText(saved_client_id)
         self.twitch_auth_status.setText(
             "Connected to Twitch." if twitch_api.load_refresh_token()
             else "Not connected. Stream IDs are optional, but Twitch authorization enables them.")

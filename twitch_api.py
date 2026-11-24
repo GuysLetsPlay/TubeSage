@@ -15,7 +15,7 @@ from PySide6.QtCore import QThread, Signal
 from app_paths import DATA_DIR
 
 
-DEFAULT_CLIENT_ID = "95litvelyd4mlshypb9pakhhzm0vyh"
+DEFAULT_CLIENT_ID = "95litvelyd4mlshypb9pakhhzm0vvh"
 DEVICE_URL = "https://id.twitch.tv/oauth2/device"
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 VIDEOS_URL = "https://api.twitch.tv/helix/videos"

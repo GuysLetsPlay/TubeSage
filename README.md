@@ -9,9 +9,9 @@ OpenCode to research a fix.
 
 1. Open the [latest TubeSage release](https://github.com/GuysLetsPlay/TubeSage/releases/latest).
 2. Download **TubeSage-Setup.exe** and open it.
-3. Approve the Windows administrator prompt and follow the installer steps.
-   TubeSage installs under Program Files and does not require Python.
-4. Open TubeSage from the Start menu or the optional desktop shortcut.
+3. Follow the installer steps. TubeSage installs in your Windows user profile,
+   so installation and in-app updates do not require administrator approval.
+4. Open TubeSage from the Start menu or desktop shortcut.
 
 On first run, TubeSage downloads yt-dlp automatically. To merge high-quality
 video and audio or convert to MP3, choose **Settings → Install ffmpeg**.
@@ -34,6 +34,10 @@ only download it from this repository's Releases page.
 - Expand each VOD to track downloaded and uploaded status per segment, see the
   active VOD and segment, prioritize a segment next, and delete individual files
 - Segment filenames include the numeric Twitch VOD ID for direct Twitch lookup
+- Connect a Twitch Developer app in Settings to add the originating stream ID
+  beside each VOD ID in the archive list and downloaded segment filenames
+- Check for TubeSage updates in Settings; downloads are SHA-256 verified and
+  install in the current user's profile without an administrator prompt
 - Error Doctor with yt-dlp GitHub issue search, optional YTDLNIS Telegram
   reader, and deep research through an installed Codex, Cline, or OpenCode CLI
 
