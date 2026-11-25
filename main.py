@@ -428,6 +428,7 @@ class MainWindow(QMainWindow):
         self.twitch_metadata_worker: twitch_api.VideoMetadataWorker | None = None
         self.update_worker: app_updater.UpdateWorker | None = None
         self._resume_after_pause = False
+        self._speed_restart_jobs: set[str] = set()
         self.archive_timer = QTimer(self)
         self.archive_timer.setInterval(30_000)
         self.archive_timer.timeout.connect(self._archive_tick)
@@ -482,17 +483,6 @@ class MainWindow(QMainWindow):
         self.preset_combo.addItems([p[0] for p in downloader.PRESETS])
         self.preset_combo.setCurrentText(SETTINGS.get("preset", "Best quality"))
         form.addRow("Quality / format:", self.preset_combo)
-
-        self.download_speed_limit = QSpinBox()
-        self.download_speed_limit.setRange(0, 100000)
-        self.download_speed_limit.setSingleStep(100)
-        self.download_speed_limit.setSuffix(" KB/s (0 = unlimited)")
-        self.download_speed_limit.setValue(int(SETTINGS.get("download_speed_limit_kbs", 0)))
-        self.download_speed_limit.setToolTip(
-            "Applies to TubeSage downloads, including the Twitch archive. "
-            "Pause and resume an active archive to apply a changed limit.")
-        self.download_speed_limit.valueChanged.connect(self._save_speed_limit)
-        form.addRow("Maximum download speed:", self.download_speed_limit)
 
         self.out_edit = QLineEdit(SETTINGS.get("output_dir", ""))
         btn_out = QPushButton("…")
@@ -603,7 +593,7 @@ class MainWindow(QMainWindow):
             url=url,
             preset=self.preset_combo.currentText(),
             output_dir=self.out_edit.text().strip() or str(downloader.DEFAULT_OUTPUT),
-            speed_limit_kbs=self.download_speed_limit.value(),
+            speed_limit_kbs=int(SETTINGS.get("download_speed_limit_kbs", 0)),
             playlist=self.chk_playlist.isChecked(),
             subtitles=self.chk_subs.isChecked(),
             embed_thumbnail=self.chk_thumb.isChecked(),
@@ -775,6 +765,25 @@ class MainWindow(QMainWindow):
         if row and job and row.text(0) == job.url and job.title != job.url:
             row.setText(0, job.title)
         self._grid_sync(jid)
+        self._refresh_speed_limit_status()
+
+    def _restart_download_after_speed_limit(self, jid: str):
+        if jid not in self._speed_restart_jobs:
+            return
+        worker = self.workers.get(jid)
+        if worker and worker.isRunning():
+            QTimer.singleShot(100, lambda download_id=jid:
+                              self._restart_download_after_speed_limit(download_id))
+            return
+        self._speed_restart_jobs.discard(jid)
+        job = self.jobs.get(jid)
+        if not job:
+            return
+        job.speed_limit_kbs = int(SETTINGS.get("download_speed_limit_kbs", 0))
+        job.resume = True
+        job.pct = 0.0
+        job.watch_opened = False
+        self._enqueue(job)
 
     def _on_failed(self, jid: str, error_text: str):
         row = self.rows.get(jid)
@@ -805,6 +814,7 @@ class MainWindow(QMainWindow):
                     "when": _t.strftime("%Y-%m-%d %H:%M")})
                 save_settings(SETTINGS)
                 self._refresh_history()
+        self._refresh_speed_limit_status()
 
     def _selected_jid(self) -> str | None:
         item = self.queue_tree.currentItem()
@@ -834,6 +844,7 @@ class MainWindow(QMainWindow):
             job.preset = self.preset_combo.currentText()
             job.watch_while = self.chk_watch.isChecked()
             job.resume = self.chk_resume.isChecked()
+            job.speed_limit_kbs = int(SETTINGS.get("download_speed_limit_kbs", 0))
             job.pct = 0.0
             job.watch_opened = False    # part_file is kept on purpose — the
             self._enqueue(job)          # stale-part recovery may need it
@@ -1021,6 +1032,43 @@ class MainWindow(QMainWindow):
         scroll.setWidget(body)
         outer.addWidget(scroll)
 
+        speed = QGroupBox("Download speed restriction")
+        sl = QVBoxLayout(speed)
+        speed_form = QFormLayout()
+        self.download_speed_limit = QSpinBox()
+        self.download_speed_limit.setRange(0, 100000)
+        self.download_speed_limit.setSingleStep(100)
+        self.download_speed_limit.setSuffix(" KB/s (0 = unlimited)")
+        self.download_speed_limit.setValue(int(SETTINGS.get("download_speed_limit_kbs", 0)))
+        self.download_speed_limit.setToolTip(
+            "Choose a maximum speed for TubeSage downloads. The value takes effect only "
+            "after you choose one of the Apply buttons.")
+        speed_form.addRow("Maximum speed:", self.download_speed_limit)
+        sl.addLayout(speed_form)
+        speed_actions = QHBoxLayout()
+        self.speed_apply_restart_button = QPushButton("Apply and Restart")
+        self.speed_apply_restart_button.setToolTip(
+            "Apply this speed and restart active downloads so they use it.")
+        self.speed_apply_restart_button.clicked.connect(self._apply_speed_limit_restart)
+        self.speed_apply_new_button = QPushButton("Apply when new download starts")
+        self.speed_apply_new_button.setToolTip(
+            "Use this speed for downloads started from now on. Running downloads keep their current speed.")
+        self.speed_apply_new_button.clicked.connect(self._apply_speed_limit_for_new_downloads)
+        self.speed_remove_button = QPushButton("Remove Limit")
+        self.speed_remove_button.setToolTip(
+            "Set the speed to unlimited and restart active downloads with no limit.")
+        self.speed_remove_button.clicked.connect(self._remove_speed_limit)
+        speed_actions.addWidget(self.speed_apply_restart_button)
+        speed_actions.addWidget(self.speed_apply_new_button)
+        speed_actions.addWidget(self.speed_remove_button)
+        speed_actions.addStretch(1)
+        sl.addLayout(speed_actions)
+        self.speed_limit_status = QLabel()
+        self.speed_limit_status.setWordWrap(True)
+        sl.addWidget(self.speed_limit_status)
+        self._refresh_speed_limit_status()
+        lay.addWidget(speed)
+
         eng = QGroupBox("Download engine")
         el = QVBoxLayout(eng)
         self.ytdlp_label = QLabel()
@@ -1127,7 +1175,7 @@ class MainWindow(QMainWindow):
             "Completed segment files are checked automatically; check Uploaded after YouTube Studio, "
             "or use that segment's Delete button. Downloads save 15-minute checkpoints inside each six-hour segment, "
             "so a window pause retries at most the current checkpoint before joining the finished segment. "
-            "Set the maximum speed in KB/s, or use 0 for unlimited speed. Install ffmpeg in the Download engine section.")
+            "Set download speed in Settings. Install ffmpeg in the Download engine section.")
         archive_help.setWordWrap(True)
         al.addWidget(archive_help)
         archive_actions = QHBoxLayout()
@@ -1226,7 +1274,6 @@ class MainWindow(QMainWindow):
         SETTINGS["cookies_file"] = self.cookies_edit.text().strip()
         SETTINGS["extra_args"] = self.extra_edit.text().strip()
         SETTINGS["preset"] = self.preset_combo.currentText()
-        SETTINGS["download_speed_limit_kbs"] = self.download_speed_limit.value()
         self._save_archive_settings()
         save_settings(SETTINGS)
         if self.archive_auto_refresh.isChecked():
@@ -1269,9 +1316,55 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "TubeSage update", f"Could not start the installer: {exc}")
 
-    def _save_speed_limit(self, value: int):
-        SETTINGS["download_speed_limit_kbs"] = int(value)
+    @staticmethod
+    def _speed_limit_label(value: int) -> str:
+        return "Unlimited" if value <= 0 else f"{value:,} KB/s"
+
+    def _refresh_speed_limit_status(self, message: str = ""):
+        value = int(SETTINGS.get("download_speed_limit_kbs", 0))
+        text = f"Applied for new downloads: {self._speed_limit_label(value)}."
+        active = sum(1 for worker in self.workers.values()
+                     if worker.isRunning() and worker.job.state == "downloading")
+        archive_active = bool(self.archive_worker and self.archive_worker.isRunning())
+        if active or archive_active:
+            text += " Running downloads keep their current setting unless restarted."
+        if message:
+            text = f"{message} {text}"
+        self.speed_limit_status.setText(text)
+
+    def _apply_speed_limit_for_new_downloads(self):
+        value = int(self.download_speed_limit.value())
+        SETTINGS["download_speed_limit_kbs"] = value
         save_settings(SETTINGS)
+        if self.archive_worker and self.archive_worker.isRunning():
+            self.archive_worker.set_speed_limit_for_next_download(value)
+        self._refresh_speed_limit_status(
+            f"Applied {self._speed_limit_label(value)} for new downloads.")
+
+    def _apply_speed_limit_restart(self):
+        value = int(self.download_speed_limit.value())
+        SETTINGS["download_speed_limit_kbs"] = value
+        save_settings(SETTINGS)
+        active_jobs = [jid for jid, worker in self.workers.items()
+                       if worker.isRunning() and worker.job.state == "downloading"]
+        self._speed_restart_jobs.update(active_jobs)
+        for jid in active_jobs:
+            worker = self.workers[jid]
+            worker.cancel()
+            QTimer.singleShot(100, lambda download_id=jid:
+                              self._restart_download_after_speed_limit(download_id))
+        if self.archive_worker and self.archive_worker.isRunning():
+            self._resume_after_pause = not self._archive_settings().get("paused", False)
+            self.archive_worker.pause()
+        if active_jobs or (self.archive_worker and self.archive_worker.isRunning()):
+            message = f"Applied {self._speed_limit_label(value)}; restarting active downloads."
+        else:
+            message = f"Applied {self._speed_limit_label(value)} for future downloads."
+        self._refresh_speed_limit_status(message)
+
+    def _remove_speed_limit(self):
+        self.download_speed_limit.setValue(0)
+        self._apply_speed_limit_restart()
 
     # ------------------------------------------------ Twitch archive ----
     def _twitch_connect(self):
@@ -1920,6 +2013,7 @@ class MainWindow(QMainWindow):
 
     def _archive_worker_finished(self):
         self._rename_stream_id_segments()
+        self._refresh_speed_limit_status()
         if self._resume_after_pause and not self._archive_settings().get("paused", False):
             self._resume_after_pause = False
             QTimer.singleShot(0, self._archive_tick)

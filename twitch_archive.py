@@ -327,9 +327,14 @@ class ArchiveDownloadWorker(QThread):
         self.end_time = end_time
         self.max_bytes = max(0, int(max_gb * 1024**3))
         self.speed_limit_kbs = max(0, int(speed_limit_kbs))
+        self._next_download_speed_limit_kbs: int | None = None
         self._cancel = False
         self._pause_requested = False
         self._proc: subprocess.Popen | None = None
+
+    def set_speed_limit_for_next_download(self, speed_limit_kbs: int) -> None:
+        """Stage a new limit for the next six-hour archive segment."""
+        self._next_download_speed_limit_kbs = max(0, int(speed_limit_kbs))
 
     def cancel(self):
         self._cancel = True
@@ -491,6 +496,9 @@ class ArchiveDownloadWorker(QThread):
                     break
                 if segment in vod.get("segments_done", []) or segment in vod.get("segments_uploaded", []):
                     continue
+                if self._next_download_speed_limit_kbs is not None:
+                    self.speed_limit_kbs = self._next_download_speed_limit_kbs
+                    self._next_download_speed_limit_kbs = None
                 if self.max_bytes and directory_size(self.output_root) >= self.max_bytes:
                     failed = "Storage allowance reached"
                     break

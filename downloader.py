@@ -214,9 +214,16 @@ class DownloadWorker(QThread):
         self._cancel = True
         if self._proc and self._proc.poll() is None:
             try:
-                self._proc.kill()
-            except Exception:
-                pass
+                subprocess.Popen(
+                    ["taskkill.exe", "/PID", str(self._proc.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
 
     def run(self):
         job = self.job
@@ -279,11 +286,17 @@ class DownloadWorker(QThread):
             if m2:
                 last_path = m2.group(1).strip()
             if self._cancel:
-                self._proc.kill()
+                if self._proc.poll() is None:
+                    self._proc.kill()
+                self._proc.wait()
                 job.state = "cancelled"
                 self.state_changed.emit(job.id, job.state)
                 return
         code = self._proc.wait()
+        if self._cancel:
+            job.state = "cancelled"
+            self.state_changed.emit(job.id, job.state)
+            return
         if code == 0:
             job.state = "finished"
             job.pct = 100.0
