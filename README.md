@@ -32,7 +32,8 @@ only download it from this repository's Releases page.
   configured storage allowance, with pause/resume, a download speed limit, and
   per-VOD files named E1, E2, and so on; segment filenames fit YouTube's
   100-character title limit by shortening the middle of long Twitch titles while
-  preserving the episode prefix and Twitch VOD/Stream ID suffixes
+  preserving the episode prefix and Twitch VOD/Stream ID suffixes; each segment
+  downloads in 15-minute checkpoints so schedule pauses do not restart six hours
 - Expand each VOD to track downloaded and uploaded status per segment, see the
   active VOD and segment, prioritize a segment next, and delete individual files
 - Segment filenames include the numeric Twitch VOD ID for direct Twitch lookup

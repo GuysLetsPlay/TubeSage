@@ -1125,7 +1125,8 @@ class MainWindow(QMainWindow):
         archive_help = QLabel(
             "TubeSage lists public Twitch archive VODs. Expand a VOD to see its six-hour segments. "
             "Completed segment files are checked automatically; check Uploaded after YouTube Studio, "
-            "or use that segment's Delete button. Pause preserves the partial file, and Resume continues it. "
+            "or use that segment's Delete button. Downloads save 15-minute checkpoints inside each six-hour segment, "
+            "so a window pause retries at most the current checkpoint before joining the finished segment. "
             "Set the maximum speed in KB/s, or use 0 for unlimited speed. Install ffmpeg in the Download engine section.")
         archive_help.setWordWrap(True)
         al.addWidget(archive_help)
@@ -1397,9 +1398,12 @@ class MainWindow(QMainWindow):
             partial_segments = []
             for segment in range(count):
                 files = twitch_archive.segment_files(folder, vod, segment)
+                checkpoint_done = twitch_archive.completed_checkpoints(folder, segment)
+                checkpoint_total = twitch_archive.segment_checkpoint_count(vod, segment)
                 if any(not path.name.endswith((".part", ".ytdl")) for path in files):
                     done.add(segment)
-                if any(path.name.endswith(".part") for path in files):
+                if (any(path.name.endswith(".part") for path in files)
+                        or 0 < checkpoint_done < checkpoint_total):
                     partial_segments.append(segment)
             if partial_segments and vod.get("status") in ("downloading", "paused"):
                 vod["current_segment"] = partial_segments[0]
@@ -1568,6 +1572,8 @@ class MainWindow(QMainWindow):
             uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
             for segment in range(count):
                 files = twitch_archive.segment_files(folder, vod, segment)
+                checkpoint_total = twitch_archive.segment_checkpoint_count(vod, segment)
+                checkpoint_done = twitch_archive.completed_checkpoints(folder, segment)
                 downloaded = segment in done or any(
                     not path.name.endswith((".part", ".ytdl")) for path in files)
                 if downloaded:
@@ -1575,6 +1581,12 @@ class MainWindow(QMainWindow):
                 label = f"E{segment + 1}"
                 if status in ("downloading", "paused") and current_segment == segment:
                     label += " - DOWNLOADING NOW" if status == "downloading" else " - PAUSED HERE"
+                    if checkpoint_done:
+                        saved = checkpoint_done * twitch_archive.CHECKPOINT_SECONDS
+                        hours, remainder = divmod(saved, 3600)
+                        minutes = remainder // 60
+                        label += (f" - {hours}h {minutes:02d}m saved "
+                                  f"({checkpoint_done}/{checkpoint_total} checkpoints)")
                 label += f" - {files[0].name}" if files else " - not downloaded"
                 child = QTreeWidgetItem([label, "", "", "", ""])
                 child.setData(0, Qt.UserRole, vod_id)
@@ -1600,7 +1612,7 @@ class MainWindow(QMainWindow):
                 actions_layout = QHBoxLayout(actions)
                 actions_layout.setContentsMargins(2, 0, 2, 0)
                 next_button = QPushButton("Download next")
-                next_button.setToolTip("Pause current segment, then prioritize this segment")
+                next_button.setToolTip("Pause the current checkpoint, then prioritize this segment")
                 next_button.setEnabled(segment not in done and segment not in uploaded)
                 next_button.clicked.connect(
                     lambda _checked=False, vid=vod_id, seg=segment:
@@ -1629,7 +1641,10 @@ class MainWindow(QMainWindow):
             verb = "Downloading" if active.get("status") == "downloading" else "Paused at"
             self.archive_current.setText(
                 f"{verb}: {active.get('title', '')} ({active.get('date', '')}) - "
-                f"E{segment + 1}/{total} - Twitch VOD ID {str(active.get('id', '')).removeprefix('v')}")
+                f"E{segment + 1}/{total} - "
+                f"checkpoint {twitch_archive.completed_checkpoints(twitch_archive.vod_folder(self._archive_settings().get('output_dir', ''), active), segment)}/"
+                f"{twitch_archive.segment_checkpoint_count(active, segment)} - "
+                f"Twitch VOD ID {str(active.get('id', '')).removeprefix('v')}")
         else:
             self.archive_current.setText("Current download: no segment is active.")
 
@@ -1713,13 +1728,17 @@ class MainWindow(QMainWindow):
         if self.archive_worker and self.archive_worker.isRunning():
             QMessageBox.information(self, "TubeSage", "Pause downloads before deleting a segment.")
             return
-        files = twitch_archive.segment_files(twitch_archive.vod_folder(a["output_dir"], vod),
-                                             vod, segment)
-        if not files:
+        folder = twitch_archive.vod_folder(a["output_dir"], vod)
+        files = twitch_archive.segment_files(folder, vod, segment)
+        workspace = twitch_archive.checkpoint_workspace(folder, segment)
+        if not files and not workspace.exists():
             return
+        summary = [path.name for path in files]
+        if workspace.exists():
+            summary.append(f"Checkpoint data: {workspace}")
         confirm = QMessageBox.question(self, "Delete segment files?",
                                        "Permanently delete these files?\n\n" +
-                                       "\n".join(path.name for path in files))
+                                       "\n".join(summary))
         if confirm != QMessageBox.Yes:
             return
         for path in files:
@@ -1727,6 +1746,13 @@ class MainWindow(QMainWindow):
                 path.unlink()
             except OSError as exc:
                 QMessageBox.warning(self, "TubeSage", f"Could not delete {path.name}: {exc}")
+        if workspace.exists():
+            try:
+                shutil.rmtree(workspace)
+                if not any(workspace.parent.iterdir()):
+                    workspace.parent.rmdir()
+            except OSError as exc:
+                QMessageBox.warning(self, "TubeSage", f"Could not delete checkpoint data: {exc}")
         done = {int(i) for i in vod.get("segments_done", [])}
         uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
         if segment not in uploaded:
@@ -1735,6 +1761,11 @@ class MainWindow(QMainWindow):
         if vod.get("status") in ("downloaded", "done") and segment not in uploaded:
             vod["status"] = "queued"
             vod["selected"] = True
+        for key in ("next_segment", "active_segment"):
+            priority = a.get(key)
+            if (isinstance(priority, dict) and str(priority.get("vod_id")) == str(vod_id)
+                    and int(priority.get("segment", -1)) == int(segment)):
+                a.pop(key, None)
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
         self._refresh_archive_table()
@@ -1825,12 +1856,24 @@ class MainWindow(QMainWindow):
         if not pending:
             return
         priority = a.get("next_segment")
-        if isinstance(priority, dict) and isinstance(priority.get("segment"), int):
+        if not isinstance(priority, dict):
+            priority = a.get("active_segment")
+        priority_vod = next((vod for vod in pending
+                             if isinstance(priority, dict)
+                             and str(vod.get("id")) == str(priority.get("vod_id"))), None)
+        if (priority_vod and isinstance(priority.get("segment"), int)):
             priority_id = str(priority.get("vod_id", ""))
-            for vod in pending:
-                if str(vod.get("id")) == priority_id:
-                    vod["priority_segment"] = int(priority["segment"])
+            priority_vod["priority_segment"] = int(priority["segment"])
             pending.sort(key=lambda vod: str(vod.get("id")) != priority_id)
+        else:
+            # After a restart/window pause, continue the specific segment that
+            # was active before moving on to other selected VODs.
+            partial = next((vod for vod in pending
+                            if isinstance(vod.get("current_segment"), int)), None)
+            if partial:
+                partial["priority_segment"] = int(partial["current_segment"])
+                partial_id = str(partial.get("id", ""))
+                pending.sort(key=lambda vod: str(vod.get("id")) != partial_id)
         self._save_archive_settings()
         a = self._archive_settings()
         self.archive_worker = ArchiveDownloadWorker(
@@ -1900,6 +1943,10 @@ class MainWindow(QMainWindow):
                 if (isinstance(priority, dict) and str(priority.get("vod_id")) == str(vod_id)
                         and int(priority.get("segment", -1)) == int(segment)):
                     a.pop("next_segment", None)
+                active = a.get("active_segment")
+                if (isinstance(active, dict) and str(active.get("vod_id")) == str(vod_id)
+                        and int(active.get("segment", -1)) == int(segment)):
+                    a.pop("active_segment", None)
                 break
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
@@ -1907,6 +1954,7 @@ class MainWindow(QMainWindow):
 
     def _archive_segment_started(self, vod_id: str, segment: int, total: int):
         a = self._archive_settings()
+        a["active_segment"] = {"vod_id": str(vod_id), "segment": int(segment)}
         for vod in a.get("vods", []):
             if str(vod.get("id")) == str(vod_id):
                 vod["current_segment"] = int(segment)
