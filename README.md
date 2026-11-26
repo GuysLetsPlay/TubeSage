@@ -33,7 +33,8 @@ only download it from this repository's Releases page.
   per-VOD files named E1, E2, and so on; segment filenames fit YouTube's
   100-character title limit by shortening the middle of long Twitch titles while
   preserving the episode prefix and Twitch VOD/Stream ID suffixes; each segment
-  downloads in 15-minute checkpoints so schedule pauses do not restart six hours
+  downloads in 15-minute checkpoints (up to six concurrently) so schedule pauses
+  do not restart six hours; range cuts avoid slow forced keyframe re-encoding
 - Configure the download speed in Settings: apply it to new downloads, restart
   active downloads to apply it immediately, or remove the limit for unlimited speed
 - Expand each VOD to track downloaded and uploaded status per segment, see the

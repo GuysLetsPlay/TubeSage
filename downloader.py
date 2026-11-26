@@ -71,7 +71,7 @@ class Job:
         if self.watch_while and not audio:
             fmt = progressive_first(fmt)
         args = [
-            "--newline", "--progress",
+            "--newline", "--progress", "-N", "6",
             "-f", fmt,
             "-o", str(Path(self.output_dir) / "%(title)s [%(id)s].%(ext)s"),
             *mgr.ensure_ffmpeg_flag(),

@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from subprocess import TimeoutExpired
 from datetime import date, datetime, time as clock_time
 import math
@@ -16,6 +20,7 @@ import ytdlp_manager as mgr
 
 SEGMENT_SECONDS = 6 * 60 * 60
 CHECKPOINT_SECONDS = 15 * 60
+CONCURRENT_CHECKPOINTS = 6
 YOUTUBE_TITLE_LIMIT = 100
 
 
@@ -330,7 +335,11 @@ class ArchiveDownloadWorker(QThread):
         self._next_download_speed_limit_kbs: int | None = None
         self._cancel = False
         self._pause_requested = False
-        self._proc: subprocess.Popen | None = None
+        self._processes: set[subprocess.Popen] = set()
+        self._process_lock = threading.Lock()
+        self._window_closed = threading.Event()
+        self._storage_full = threading.Event()
+        self._segment_failed = threading.Event()
 
     def set_speed_limit_for_next_download(self, speed_limit_kbs: int) -> None:
         """Stage a new limit for the next six-hour archive segment."""
@@ -338,11 +347,19 @@ class ArchiveDownloadWorker(QThread):
 
     def cancel(self):
         self._cancel = True
-        stop_process_tree(self._proc)
+        self._stop_processes()
 
     def pause(self):
         self._pause_requested = True
-        stop_process_tree(self._proc)
+        self._stop_processes()
+
+    def _stop_processes(self) -> None:
+        with self._process_lock:
+            processes = list(self._processes)
+        if not processes:
+            return
+        with ThreadPoolExecutor(max_workers=len(processes)) as pool:
+            list(pool.map(stop_process_tree, processes))
 
     def _wait_for_window(self) -> bool:
         while (not self._cancel and not self._pause_requested
@@ -354,46 +371,127 @@ class ArchiveDownloadWorker(QThread):
                 time.sleep(3)
         return not self._cancel and not self._pause_requested
 
-    def _run_process(self, args: list[str], cwd: Path | None = None):
+    def _run_process(self, args: list[str], cwd: Path | None = None,
+                     tracked_file: Path | None = None):
         """Run yt-dlp/ffmpeg and stop promptly at a window boundary."""
         failed = ""
         window_closed = False
+        process: subprocess.Popen | None = None
+        reader: threading.Thread | None = None
         try:
-            self._proc = subprocess.Popen(
+            process = subprocess.Popen(
                 args, cwd=str(cwd) if cwd else None, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW)
-            if self._cancel or self._pause_requested:
-                stop_process_tree(self._proc)
+            with self._process_lock:
+                self._processes.add(process)
+            output_lines: queue.Queue[str] = queue.Queue()
+
+            def read_output():
+                pending = bytearray()
+                if process.stdout is None:
+                    return
+                while True:
+                    try:
+                        data = os.read(process.stdout.fileno(), 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    for byte in data:
+                        if byte in (10, 13):
+                            if pending:
+                                output_lines.put(pending.decode("utf-8", errors="replace"))
+                                pending.clear()
+                        else:
+                            pending.append(byte)
+                if pending:
+                    output_lines.put(pending.decode("utf-8", errors="replace"))
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            if (self._cancel or self._pause_requested or self._segment_failed.is_set()
+                    or self._window_closed.is_set() or self._storage_full.is_set()):
+                stop_process_tree(process)
             last_size_check = time.monotonic()
-            while (self._proc.poll() is None and not self._cancel
-                   and not self._pause_requested):
+            last_rate_check = time.monotonic()
+            last_rate_size = 0
+            while (process.poll() is None and not self._cancel
+                   and not self._pause_requested and not self._segment_failed.is_set()
+                   and not self._window_closed.is_set() and not self._storage_full.is_set()):
                 now = time.monotonic()
                 if (self.max_bytes and now - last_size_check >= 30
                         and directory_size(self.output_root) >= self.max_bytes):
-                    stop_process_tree(self._proc)
-                    self._proc.wait()
+                    self._storage_full.set()
+                    self._stop_processes()
                     failed = "Storage allowance reached"
                     break
                 if now - last_size_check >= 30:
                     last_size_check = now
                 if not schedule_open(self.start_time, self.end_time):
-                    stop_process_tree(self._proc)
-                    self._proc.wait()
+                    self._window_closed.set()
+                    self._stop_processes()
                     window_closed = True
                     break
-                line = self._proc.stdout.readline() if self._proc.stdout else ""
+                try:
+                    line = output_lines.get(timeout=0.25)
+                except queue.Empty:
+                    line = ""
                 if line and line.strip():
-                    self.progress.emit(line.strip()[-220:])
-            return self._proc.wait(), failed, window_closed
+                    clean = line.strip()
+                    fps = re.search(r"\bfps=\s*([\d.]+)", clean)
+                    ffmpeg_speed = re.search(r"\bspeed=\s*([^\s]+)", clean)
+                    if fps:
+                        detail = f"FFmpeg processing: {fps.group(1)} FPS"
+                        if ffmpeg_speed:
+                            detail += f" ({ffmpeg_speed.group(1)} media speed)"
+                        self.progress.emit(detail)
+                    else:
+                        self.progress.emit(clean[-220:])
+                now = time.monotonic()
+                if tracked_file and now - last_rate_check >= 1.0:
+                    try:
+                        current_size = tracked_file.stat().st_size
+                    except OSError:
+                        current_size = last_rate_size
+                    elapsed = now - last_rate_check
+                    if current_size >= last_rate_size and elapsed > 0:
+                        rate_mib = (current_size - last_rate_size) / elapsed / (1024 ** 2)
+                        self.progress.emit(
+                            f"{tracked_file.stem} output write rate: {rate_mib:.2f} MiB/s")
+                    last_rate_check = now
+                    last_rate_size = current_size
+            code = process.wait()
+            if self._window_closed.is_set():
+                window_closed = True
+            if self._storage_full.is_set():
+                failed = "Storage allowance reached"
+            return code, failed, window_closed
         except Exception as exc:
             return 1, str(exc), window_closed
         finally:
-            self._proc = None
+            if process:
+                if reader:
+                    reader.join(timeout=1)
+                if process.stdout:
+                    try:
+                        process.stdout.close()
+                    except OSError:
+                        pass
+                with self._process_lock:
+                    self._processes.discard(process)
 
     def _download_checkpoint(self, exe: Path, vod: dict, segment: int,
                              checkpoint: int, start: int, finish: int,
-                             workspace: Path):
+                             workspace: Path, speed_limit_kbs: int = 0):
+        if (self._cancel or self._pause_requested or self._window_closed.is_set()
+                or self._storage_full.is_set()
+                or self._segment_failed.is_set()):
+            return 1, "", self._window_closed.is_set()
+        if not schedule_open(self.start_time, self.end_time):
+            self._window_closed.set()
+            self._stop_processes()
+            return 1, "", True
         output = workspace / f"checkpoint-{checkpoint:03d}.mp4"
         if output.is_file() and output.stat().st_size:
             return 0, "", False
@@ -405,13 +503,14 @@ class ArchiveDownloadWorker(QThread):
         template = str(workspace / f"checkpoint-{checkpoint:03d}.%(ext)s")
         args = [str(exe), "--newline", "--continue", "--no-playlist",
                 "--download-sections", f"*{format_timestamp(start)}-{format_timestamp(finish)}",
-                "--force-keyframes-at-cuts", "--remux-video", "mp4",
+                "--no-force-keyframes-at-cuts", "--remux-video", "mp4",
+                "--downloader-args", "ffmpeg_i:-http_multiple 1",
                 "-f", "bv*+ba/b", "-o", template,
                 *mgr.ensure_ffmpeg_flag(), *mgr.ensure_js_flag(), vod["url"]]
-        if self.speed_limit_kbs:
-            args[1:1] = ["--limit-rate", str(self.speed_limit_kbs * 1000)]
+        if speed_limit_kbs:
+            args[1:1] = ["--limit-rate", str(speed_limit_kbs * 1000)]
         self.progress.emit(f"{vod['title']} — E{segment + 1}, checkpoint {checkpoint + 1}")
-        return self._run_process(args)
+        return self._run_process(args, tracked_file=output.with_name(output.name + ".part"))
 
     def _assemble_segment(self, vod: dict, segment: int, chunks: list[Path],
                           folder: Path, workspace: Path):
@@ -487,10 +586,6 @@ class ArchiveDownloadWorker(QThread):
             self.changed.emit(vod["id"], "downloading", "Downloading six-hour segments")
             failed = ""
             segment_order = list(range(count))
-            priority_segment = vod.get("priority_segment")
-            if isinstance(priority_segment, int) and 0 <= priority_segment < count:
-                segment_order.remove(priority_segment)
-                segment_order.insert(0, priority_segment)
             for segment in segment_order:
                 if self._cancel or not self._wait_for_window():
                     break
@@ -520,28 +615,57 @@ class ArchiveDownloadWorker(QThread):
                 self.segment_started.emit(str(vod["id"]), segment, count)
                 window_closed = False
                 segment_assembled = False
+                self._segment_failed.clear()
+                jobs = []
                 for checkpoint, chunk_path in enumerate(chunks):
-                    if self._cancel or not self._wait_for_window():
-                        break
-                    if chunk_path.is_file() and chunk_path.stat().st_size > 0:
-                        continue
-                    chunk_start = start + checkpoint * CHECKPOINT_SECONDS
-                    chunk_finish = min(finish, chunk_start + CHECKPOINT_SECONDS)
-                    code, checkpoint_error, window_closed = self._download_checkpoint(
-                        exe, vod, segment, checkpoint, chunk_start, chunk_finish, workspace)
-                    if checkpoint_error == "Storage allowance reached":
-                        failed = checkpoint_error
-                        break
-                    if self._cancel or self._pause_requested or window_closed:
-                        break
-                    if code:
-                        failed = checkpoint_error or (
-                            f"yt-dlp stopped at E{segment + 1} checkpoint {checkpoint + 1} "
-                            f"(exit {code})")
-                        break
-                    if self.max_bytes and directory_size(self.output_root) >= self.max_bytes:
-                        failed = "Storage allowance reached"
-                        break
+                    if not chunk_path.is_file() or not chunk_path.stat().st_size:
+                        jobs.append((checkpoint, chunk_path))
+                self.progress.emit(
+                    f"Downloading up to {CONCURRENT_CHECKPOINTS} checkpoints at once.")
+                if jobs:
+                    concurrency = min(CONCURRENT_CHECKPOINTS, len(jobs))
+                    if self.speed_limit_kbs:
+                        concurrency = min(concurrency, max(1, self.speed_limit_kbs))
+                    per_checkpoint_limit = (
+                        max(1, self.speed_limit_kbs // concurrency)
+                        if self.speed_limit_kbs else 0)
+                    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                        futures = {}
+                        for checkpoint, chunk_path in jobs:
+                            chunk_start = start + checkpoint * CHECKPOINT_SECONDS
+                            chunk_finish = min(finish, chunk_start + CHECKPOINT_SECONDS)
+                            future = pool.submit(
+                                self._download_checkpoint, exe, vod, segment, checkpoint,
+                                chunk_start, chunk_finish, workspace, per_checkpoint_limit)
+                            futures[future] = checkpoint
+                        for future in as_completed(futures):
+                            checkpoint = futures[future]
+                            try:
+                                code, checkpoint_error, was_window_closed = future.result()
+                            except Exception as exc:
+                                code, checkpoint_error, was_window_closed = 1, str(exc), False
+                            window_closed = (window_closed or was_window_closed
+                                             or self._window_closed.is_set())
+                            if checkpoint_error == "Storage allowance reached":
+                                failed = checkpoint_error
+                            elif code and not (self._cancel or self._pause_requested
+                                               or window_closed):
+                                failed = checkpoint_error or (
+                                    f"yt-dlp stopped at E{segment + 1} checkpoint "
+                                    f"{checkpoint + 1} (exit {code})")
+                            if failed:
+                                self._segment_failed.set()
+                                self._stop_processes()
+                            if self.max_bytes and directory_size(self.output_root) >= self.max_bytes:
+                                self._storage_full.set()
+                                failed = "Storage allowance reached"
+                                self._segment_failed.set()
+                                self._stop_processes()
+                            if self._cancel or self._pause_requested or window_closed:
+                                self._stop_processes()
+                if (self._storage_full.is_set()
+                        and not failed):
+                    failed = "Storage allowance reached"
                 if (not failed and not self._cancel and not self._pause_requested
                         and not window_closed
                         and all(path.is_file() and path.stat().st_size > 0 for path in chunks)):
@@ -570,11 +694,13 @@ class ArchiveDownloadWorker(QThread):
             if self._pause_requested:
                 self.changed.emit(vod["id"], "paused", "Paused by you; resume to continue")
                 break
+            if window_closed:
+                self.changed.emit(vod["id"], "paused", "Download window closed; checkpoint will resume")
+                break
             if failed:
                 state = "storage-full" if failed == "Storage allowance reached" else "error"
                 self.changed.emit(vod["id"], state, failed)
-                if state == "storage-full":
-                    break
+                break
             elif len(set(vod.get("segments_done", []))) >= count:
                 if all(index in vod.get("segments_uploaded", []) for index in range(count)):
                     self.changed.emit(vod["id"], "done", "All segments uploaded")

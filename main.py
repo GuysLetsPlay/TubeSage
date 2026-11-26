@@ -429,6 +429,7 @@ class MainWindow(QMainWindow):
         self.update_worker: app_updater.UpdateWorker | None = None
         self._resume_after_pause = False
         self._speed_restart_jobs: set[str] = set()
+        self._archive_manual_priority: dict | None = None
         self.archive_timer = QTimer(self)
         self.archive_timer.setInterval(30_000)
         self.archive_timer.timeout.connect(self._archive_tick)
@@ -1174,28 +1175,40 @@ class MainWindow(QMainWindow):
             "TubeSage lists public Twitch archive VODs. Expand a VOD to see its six-hour segments. "
             "Completed segment files are checked automatically; check Uploaded after YouTube Studio, "
             "or use that segment's Delete button. Downloads save 15-minute checkpoints inside each six-hour segment, "
-            "so a window pause retries at most the current checkpoint before joining the finished segment. "
+            "fetch up to six checkpoints concurrently, and join them without re-encoding. FFmpeg FPS/media speed is "
+            "processing rate; the output write rate is shown separately. "
             "Set download speed in Settings. Install ffmpeg in the Download engine section.")
         archive_help.setWordWrap(True)
         al.addWidget(archive_help)
-        archive_actions = QHBoxLayout()
+        selection_group = QGroupBox("1. VOD selection and downloads")
+        archive_actions = QVBoxLayout(selection_group)
+        selection_actions = QHBoxLayout()
+        for title, callback in (("Select all", self._archive_select_all),
+                                ("Clear selection", self._archive_clear_selection)):
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            selection_actions.addWidget(button)
         find_vods = QPushButton("Find VODs now")
         find_vods.clicked.connect(self._archive_search)
+        selection_actions.addWidget(find_vods)
+        selection_actions.addStretch(1)
+        archive_actions.addLayout(selection_actions)
+        download_actions = QHBoxLayout()
         download_selected = QPushButton("Download selected")
         download_selected.clicked.connect(self._archive_tick)
+        download_actions.addWidget(download_selected)
         self.archive_pause_button = QPushButton("Pause downloads")
         self.archive_pause_button.clicked.connect(self._archive_pause)
+        download_actions.addWidget(self.archive_pause_button)
         self.archive_resume_button = QPushButton("Resume downloads")
         self.archive_resume_button.clicked.connect(self._archive_resume)
-        open_studio = QPushButton("Open YouTube Studio")
-        open_studio.clicked.connect(lambda: webbrowser.open("https://studio.youtube.com/"))
-        archive_actions.addWidget(find_vods)
-        archive_actions.addWidget(download_selected)
-        archive_actions.addWidget(self.archive_pause_button)
-        archive_actions.addWidget(self.archive_resume_button)
-        archive_actions.addWidget(open_studio)
-        archive_actions.addStretch(1)
-        al.addLayout(archive_actions)
+        download_actions.addWidget(self.archive_resume_button)
+        retry_failed = QPushButton("Retry failed")
+        retry_failed.clicked.connect(self._archive_retry_failed)
+        download_actions.addWidget(retry_failed)
+        download_actions.addStretch(1)
+        archive_actions.addLayout(download_actions)
+        al.addWidget(selection_group)
         self.archive_current = QLabel("Current download: no segment is active.")
         self.archive_current.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.archive_current.setWordWrap(True)
@@ -1219,22 +1232,27 @@ class MainWindow(QMainWindow):
         self.archive_table.itemChanged.connect(self._archive_item_changed)
         self.archive_table.itemDoubleClicked.connect(self._archive_open_twitch)
         al.addWidget(self.archive_table, 1)
-        archive_buttons = QHBoxLayout()
-        for title, callback in (("Select all", self._archive_select_all),
-                                ("Clear selection", self._archive_clear_selection)):
-            button = QPushButton(title)
-            button.clicked.connect(callback)
-            archive_buttons.addWidget(button)
-        archive_buttons.addStretch(1)
-        al.addLayout(archive_buttons)
-        file_buttons = QHBoxLayout()
-        for title, callback in (("Open Twitch VOD", self._archive_open_twitch),
-                                ("Open VOD folder", self._archive_open_folder),
-                                ("Retry failed", self._archive_retry_failed)):
-            button = QPushButton(title)
-            button.clicked.connect(callback)
-            file_buttons.addWidget(button)
-        al.addLayout(file_buttons)
+        website_group = QGroupBox("2. Websites")
+        website_buttons = QHBoxLayout(website_group)
+        open_studio = QPushButton("Open YouTube Studio")
+        open_studio.clicked.connect(lambda: webbrowser.open("https://studio.youtube.com/"))
+        website_buttons.addWidget(open_studio)
+        website_buttons.addStretch(1)
+        al.addWidget(website_group)
+        file_group = QGroupBox("3. VOD files")
+        file_buttons = QHBoxLayout(file_group)
+        open_vod = QPushButton("Open Twitch VOD")
+        open_vod.clicked.connect(self._archive_open_twitch)
+        file_buttons.addWidget(open_vod)
+        file_buttons.addStretch(1)
+        al.addWidget(file_group)
+        folder_group = QGroupBox("4. Folders")
+        folder_buttons = QHBoxLayout(folder_group)
+        open_folder = QPushButton("Open VOD folder")
+        open_folder.clicked.connect(self._archive_open_folder)
+        folder_buttons.addWidget(open_folder)
+        folder_buttons.addStretch(1)
+        al.addWidget(folder_group)
         lay.addWidget(archive, 1)
 
         doc = QGroupBox("Error Doctor")
@@ -1607,12 +1625,18 @@ class MainWindow(QMainWindow):
             self._resolve_stream_ids()
         self.archive_status.setText(
             f"Found {len(found)} VODs in this date selection; {added} new. "
-            "Select the recordings you want, then choose Download selected.")
+            "Selecting a VOD queues it automatically; selected VODs download in date order.")
 
     def _refresh_archive_table(self):
         if not hasattr(self, "archive_table"):
             return
-        vods = self._archive_settings().get("vods", [])
+        vods = sorted(self._archive_settings().get("vods", []),
+                      key=lambda vod: (str(vod.get("date", "")), str(vod.get("id", ""))))
+        vertical = self.archive_table.verticalScrollBar().value()
+        horizontal = self.archive_table.horizontalScrollBar().value()
+        current = self.archive_table.currentItem()
+        current_id = str(current.data(0, Qt.UserRole)) if current else ""
+        current_segment = current.data(0, Qt.UserRole + 1) if current else None
         expanded = {str(self.archive_table.topLevelItem(i).data(0, Qt.UserRole))
                     for i in range(self.archive_table.topLevelItemCount())
                     if self.archive_table.topLevelItem(i).isExpanded()}
@@ -1705,7 +1729,8 @@ class MainWindow(QMainWindow):
                 actions_layout = QHBoxLayout(actions)
                 actions_layout.setContentsMargins(2, 0, 2, 0)
                 next_button = QPushButton("Download next")
-                next_button.setToolTip("Pause the current checkpoint, then prioritize this segment")
+                next_button.setToolTip(
+                    "One-time override: download this segment next. Normal selection and resume use date order.")
                 next_button.setEnabled(segment not in done and segment not in uploaded)
                 next_button.clicked.connect(
                     lambda _checked=False, vid=vod_id, seg=segment:
@@ -1740,6 +1765,23 @@ class MainWindow(QMainWindow):
                 f"Twitch VOD ID {str(active.get('id', '')).removeprefix('v')}")
         else:
             self.archive_current.setText("Current download: no segment is active.")
+        if current_id:
+            for row_index in range(self.archive_table.topLevelItemCount()):
+                parent = self.archive_table.topLevelItem(row_index)
+                if str(parent.data(0, Qt.UserRole)) != current_id:
+                    continue
+                target = parent
+                if current_segment is not None:
+                    for child_index in range(parent.childCount()):
+                        candidate = parent.child(child_index)
+                        if candidate.data(0, Qt.UserRole + 1) == current_segment:
+                            target = candidate
+                            break
+                self.archive_table.setCurrentItem(target)
+                break
+        QTimer.singleShot(0, lambda v=vertical, h=horizontal: (
+            self.archive_table.verticalScrollBar().setValue(v),
+            self.archive_table.horizontalScrollBar().setValue(h)))
 
     def _archive_item_changed(self, item):
         if item.column() != 0 or item.parent() is not None:
@@ -1749,9 +1791,26 @@ class MainWindow(QMainWindow):
         for vod in a.get("vods", []):
             if str(vod.get("id")) == vod_id:
                 vod["selected"] = item.checkState() == Qt.Checked
+                if item.checkState() == Qt.Checked and vod.get("status") in (
+                        "error", "storage-full"):
+                    vod["status"] = "queued"
+                    vod["error"] = ""
                 break
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
+        self._archive_selection_changed()
+
+    def _archive_selection_changed(self):
+        a = self._archive_settings()
+        self._archive_manual_priority = None
+        if self.archive_worker and self.archive_worker.isRunning():
+            if not a.get("paused", False):
+                self._resume_after_pause = True
+                self.archive_status.setText(
+                    "Selection changed. Saving the current checkpoint, then rescanning selected VODs from the top.")
+                self.archive_worker.pause()
+        elif not a.get("paused", False):
+            QTimer.singleShot(0, self._archive_tick)
 
     def _archive_find_vod(self, vod_id: str):
         a = self._archive_settings()
@@ -1854,7 +1913,7 @@ class MainWindow(QMainWindow):
         if vod.get("status") in ("downloaded", "done") and segment not in uploaded:
             vod["status"] = "queued"
             vod["selected"] = True
-        for key in ("next_segment", "active_segment"):
+        for key in ("active_segment",):
             priority = a.get(key)
             if (isinstance(priority, dict) and str(priority.get("vod_id")) == str(vod_id)
                     and int(priority.get("segment", -1)) == int(segment)):
@@ -1871,6 +1930,7 @@ class MainWindow(QMainWindow):
         SETTINGS["twitch_archive"] = a
         save_settings(SETTINGS)
         self._refresh_archive_table()
+        self._archive_selection_changed()
 
     def _archive_select_all(self):
         self._archive_set_selection(True)
@@ -1909,17 +1969,17 @@ class MainWindow(QMainWindow):
                 vod["error"] = ""
         self._save_archive_settings()
         self._refresh_archive_table()
+        self._archive_selection_changed()
 
     def _archive_queue_segment(self, vod_id: str, segment: int):
-        a = self._archive_settings()
-        vod = next((v for v in a.get("vods", []) if str(v.get("id")) == str(vod_id)), None)
+        a, vod = self._archive_find_vod(vod_id)
         if not vod:
             return
         done = {int(i) for i in vod.get("segments_done", [])}
         uploaded = {int(i) for i in vod.get("segments_uploaded", [])}
         if segment in done or segment in uploaded:
             return
-        a["next_segment"] = {"vod_id": str(vod_id), "segment": int(segment)}
+        self._archive_manual_priority = {"vod_id": str(vod_id), "segment": int(segment)}
         vod["selected"] = True
         if vod.get("status") in ("found", "error", "storage-full", "live"):
             vod["status"] = "queued"
@@ -1943,30 +2003,55 @@ class MainWindow(QMainWindow):
         a = self._archive_settings()
         if a.get("paused", False):
             return
-        pending = [dict(v) for v in a.get("vods", [])
-                   if v.get("selected", v.get("status") in ("queued", "paused"))
-                   and v.get("status") not in ("live", "error")]
+        archive_vods = sorted(a.get("vods", []),
+                              key=lambda vod: (str(vod.get("date", "")),
+                                              str(vod.get("id", ""))))
+        pending = []
+        changed = a.pop("next_segment", None) is not None
+        for vod in archive_vods:
+            if not vod.get("selected", vod.get("status") in ("queued", "paused")):
+                continue
+            if vod.get("status") == "live":
+                continue
+            if vod.get("status") == "error":
+                self.archive_status.setText(
+                    f"{vod.get('title', 'A selected VOD')} has an error. Retry it before later VODs can start.")
+                break
+            count = max(1, (int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                           + twitch_archive.SEGMENT_SECONDS - 1)
+                        // twitch_archive.SEGMENT_SECONDS)
+            complete = {int(i) for i in vod.get("segments_uploaded", [])
+                        if 0 <= int(i) < count}
+            folder = twitch_archive.vod_folder(a.get("output_dir", ""), vod)
+            for segment in range(count):
+                files = twitch_archive.segment_files(folder, vod, segment)
+                if any(not path.name.endswith((".part", ".ytdl")) for path in files):
+                    complete.add(segment)
+            normalized = sorted(complete)
+            if normalized != sorted(int(i) for i in vod.get("segments_done", [])):
+                vod["segments_done"] = normalized
+                changed = True
+            if len(complete.intersection(range(count))) >= count:
+                vod["selected"] = False
+                vod["status"] = ("done" if all(
+                    i in set(int(s) for s in vod.get("segments_uploaded", []))
+                    for i in range(count)) else "downloaded")
+                changed = True
+                continue
+            pending.append(dict(vod))
+        if changed:
+            SETTINGS["twitch_archive"] = a
+            save_settings(SETTINGS)
+            self._refresh_archive_table()
         if not pending:
             return
-        priority = a.get("next_segment")
-        if not isinstance(priority, dict):
-            priority = a.get("active_segment")
+        priority = self._archive_manual_priority
         priority_vod = next((vod for vod in pending
                              if isinstance(priority, dict)
                              and str(vod.get("id")) == str(priority.get("vod_id"))), None)
-        if (priority_vod and isinstance(priority.get("segment"), int)):
-            priority_id = str(priority.get("vod_id", ""))
+        if priority_vod and isinstance(priority.get("segment"), int):
             priority_vod["priority_segment"] = int(priority["segment"])
-            pending.sort(key=lambda vod: str(vod.get("id")) != priority_id)
-        else:
-            # After a restart/window pause, continue the specific segment that
-            # was active before moving on to other selected VODs.
-            partial = next((vod for vod in pending
-                            if isinstance(vod.get("current_segment"), int)), None)
-            if partial:
-                partial["priority_segment"] = int(partial["current_segment"])
-                partial_id = str(partial.get("id", ""))
-                pending.sort(key=lambda vod: str(vod.get("id")) != partial_id)
+            pending.sort(key=lambda vod: str(vod.get("id")) != str(priority["vod_id"]))
         self._save_archive_settings()
         a = self._archive_settings()
         self.archive_worker = ArchiveDownloadWorker(
@@ -2033,10 +2118,10 @@ class MainWindow(QMainWindow):
                 vod["segments_done"] = sorted(done)
                 if vod.get("current_segment") == int(segment):
                     vod.pop("current_segment", None)
-                priority = a.get("next_segment")
+                priority = self._archive_manual_priority
                 if (isinstance(priority, dict) and str(priority.get("vod_id")) == str(vod_id)
                         and int(priority.get("segment", -1)) == int(segment)):
-                    a.pop("next_segment", None)
+                    self._archive_manual_priority = None
                 active = a.get("active_segment")
                 if (isinstance(active, dict) and str(active.get("vod_id")) == str(vod_id)
                         and int(active.get("segment", -1)) == int(segment)):
@@ -2048,6 +2133,10 @@ class MainWindow(QMainWindow):
 
     def _archive_segment_started(self, vod_id: str, segment: int, total: int):
         a = self._archive_settings()
+        priority = self._archive_manual_priority
+        if (isinstance(priority, dict) and str(priority.get("vod_id")) == str(vod_id)
+                and int(priority.get("segment", -1)) == int(segment)):
+            self._archive_manual_priority = None
         a["active_segment"] = {"vod_id": str(vod_id), "segment": int(segment)}
         for vod in a.get("vods", []):
             if str(vod.get("id")) == str(vod_id):
