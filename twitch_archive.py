@@ -346,6 +346,8 @@ class ArchiveDownloadWorker(QThread):
         # metadata marker when FFmpeg writes the media output directly.
         self._rate_samples: dict[str, tuple[float, int, float]] = {}
         self._rate_users: dict[str, int] = {}
+        self._process_output_sizes: dict[int, tuple[float, int]] = {}
+        self._process_rates: dict[int, tuple[float, float]] = {}
         self._window_closed = threading.Event()
         self._storage_full = threading.Event()
         self._segment_failed = threading.Event()
@@ -418,6 +420,57 @@ class ArchiveDownloadWorker(QThread):
                 self._rate_samples.pop(key, None)
             else:
                 self._rate_users[key] = users
+
+    @staticmethod
+    def _parse_rate_mib(value: str, unit: str) -> float:
+        scale = {
+            "B": 1, "kB": 1000, "KiB": 1024,
+            "MB": 1000 ** 2, "MiB": 1024 ** 2,
+            "GB": 1000 ** 3, "GiB": 1024 ** 3,
+        }.get(unit, 0)
+        return float(value) * scale / (1024 ** 2) if scale else 0.0
+
+    def _record_process_rate(self, process_id: int, rate_mib: float,
+                             now: float) -> float:
+        with self._rate_lock:
+            self._process_rates[process_id] = (now, max(0.0, rate_mib))
+            return sum(rate for stamp, rate in self._process_rates.values()
+                       if now - stamp <= 4.0)
+
+    def _progress_line_rate(self, process_id: int, line: str,
+                            now: float) -> float | None:
+        # yt-dlp's native progress line includes its measured transfer rate.
+        rate_match = re.search(
+            r"\bat\s+([\d.]+)\s*(KiB|MiB|GiB|kB|MB|GB|B)/s\b", line)
+        if rate_match:
+            rate = self._parse_rate_mib(*rate_match.groups())
+            return self._record_process_rate(process_id, rate, now)
+
+        # FFmpeg reports cumulative muxed bytes in its stats lines even when
+        # its temporary output file is buffered or not yet visible on disk.
+        size_match = re.search(
+            r"\b(?:size|Lsize)=\s*([\d.]+)\s*(KiB|kB|MiB|MB|GiB|GB|B)\b", line)
+        if not size_match:
+            return None
+        size_bytes = int(self._parse_rate_mib(*size_match.groups()) * (1024 ** 2))
+        with self._rate_lock:
+            previous = self._process_output_sizes.get(process_id)
+            self._process_output_sizes[process_id] = (now, size_bytes)
+            if previous is None:
+                return None
+            previous_time, previous_bytes = previous
+            elapsed = now - previous_time
+            if elapsed < 0.25:
+                return None
+            rate = max(0, size_bytes - previous_bytes) / elapsed / (1024 ** 2)
+            self._process_rates[process_id] = (now, rate)
+            return sum(value for stamp, value in self._process_rates.values()
+                       if now - stamp <= 4.0)
+
+    def _current_process_rate(self, now: float) -> float:
+        with self._rate_lock:
+            return sum(rate for stamp, rate in self._process_rates.values()
+                       if now - stamp <= 4.0)
 
     def _wait_for_window(self) -> bool:
         while (not self._cancel and not self._pause_requested
@@ -501,6 +554,14 @@ class ArchiveDownloadWorker(QThread):
                     line = ""
                 if line and line.strip():
                     clean = line.strip()
+                    progress_rate = self._progress_line_rate(
+                        process.pid, clean, time.monotonic())
+                    if progress_rate is not None:
+                        output_rate = self._sample_output_rate(
+                            rate_key, rate_workspace, time.monotonic()) \
+                            if rate_key and rate_workspace else 0.0
+                        self.download_speed.emit(
+                            f"{max(progress_rate, output_rate):.2f} MiB/s")
                     fps = re.search(r"\bfps=\s*([\d.]+)", clean)
                     ffmpeg_speed = re.search(r"\bspeed=\s*([^\s]+)", clean)
                     media_time = re.search(
@@ -523,7 +584,8 @@ class ArchiveDownloadWorker(QThread):
                 now = time.monotonic()
                 if rate_key and rate_workspace and now - last_rate_check >= 1.0:
                     rate_mib = self._sample_output_rate(rate_key, rate_workspace, now)
-                    self.download_speed.emit(f"{rate_mib:.2f} MiB/s")
+                    self.download_speed.emit(
+                        f"{max(rate_mib, self._current_process_rate(now)):.2f} MiB/s")
                     last_rate_check = now
             code = process.wait()
             if self._window_closed.is_set():
@@ -546,6 +608,9 @@ class ArchiveDownloadWorker(QThread):
                     self._end_rate_tracking(rate_key)
                 with self._process_lock:
                     self._processes.discard(process)
+                with self._rate_lock:
+                    self._process_output_sizes.pop(process.pid, None)
+                    self._process_rates.pop(process.pid, None)
 
     def _download_checkpoint(self, exe: Path, vod: dict, segment: int,
                              checkpoint: int, start: int, finish: int,

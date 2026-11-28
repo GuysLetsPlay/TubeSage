@@ -15,7 +15,7 @@ from PySide6.QtCore import QThread, Signal
 
 from app_paths import DATA_DIR
 
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 RELEASE_API = "https://api.github.com/repos/GuysLetsPlay/TubeSage/releases/latest"
 ASSET_NAME = "TubeSage-Setup.exe"
 
