@@ -321,6 +321,9 @@ class ArchiveDownloadWorker(QThread):
     segment_started = Signal(str, int, int)  # VOD id, zero-based segment, total segments
     segment_done = Signal(str, int)
     progress = Signal(str)
+    download_speed = Signal(str)
+    checkpoint_started = Signal(str, int, int)
+    checkpoint_progress = Signal(str, int, int, float)
     stopped = Signal()
 
     def __init__(self, vods: list[dict], output_root: str, start_time: str,
@@ -337,6 +340,8 @@ class ArchiveDownloadWorker(QThread):
         self._pause_requested = False
         self._processes: set[subprocess.Popen] = set()
         self._process_lock = threading.Lock()
+        self._rate_lock = threading.Lock()
+        self._rate_samples: dict[str, tuple[float, float]] = {}
         self._window_closed = threading.Event()
         self._storage_full = threading.Event()
         self._segment_failed = threading.Event()
@@ -372,7 +377,8 @@ class ArchiveDownloadWorker(QThread):
         return not self._cancel and not self._pause_requested
 
     def _run_process(self, args: list[str], cwd: Path | None = None,
-                     tracked_file: Path | None = None):
+                     tracked_file: Path | None = None,
+                     checkpoint_context: tuple[str, int, int, int] | None = None):
         """Run yt-dlp/ffmpeg and stop promptly at a window boundary."""
         failed = ""
         window_closed = False
@@ -441,6 +447,16 @@ class ArchiveDownloadWorker(QThread):
                     clean = line.strip()
                     fps = re.search(r"\bfps=\s*([\d.]+)", clean)
                     ffmpeg_speed = re.search(r"\bspeed=\s*([^\s]+)", clean)
+                    media_time = re.search(
+                        r"\btime=\s*(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)", clean)
+                    if checkpoint_context and media_time:
+                        hours, minutes, seconds = media_time.groups()
+                        elapsed = min(
+                            checkpoint_context[3],
+                            int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+                        self.checkpoint_progress.emit(
+                            checkpoint_context[0], checkpoint_context[1],
+                            checkpoint_context[2], elapsed)
                     if fps:
                         detail = f"FFmpeg processing: {fps.group(1)} FPS"
                         if ffmpeg_speed:
@@ -457,8 +473,12 @@ class ArchiveDownloadWorker(QThread):
                     elapsed = now - last_rate_check
                     if current_size >= last_rate_size and elapsed > 0:
                         rate_mib = (current_size - last_rate_size) / elapsed / (1024 ** 2)
-                        self.progress.emit(
-                            f"{tracked_file.stem} output write rate: {rate_mib:.2f} MiB/s")
+                        with self._rate_lock:
+                            self._rate_samples[str(tracked_file)] = (now, rate_mib)
+                            active_rates = [rate for stamp, rate in self._rate_samples.values()
+                                            if now - stamp <= 4.0]
+                        self.download_speed.emit(
+                            f"{sum(active_rates):.2f} MiB/s")
                     last_rate_check = now
                     last_rate_size = current_size
             code = process.wait()
@@ -478,6 +498,9 @@ class ArchiveDownloadWorker(QThread):
                         process.stdout.close()
                     except OSError:
                         pass
+                if tracked_file:
+                    with self._rate_lock:
+                        self._rate_samples.pop(str(tracked_file), None)
                 with self._process_lock:
                     self._processes.discard(process)
 
@@ -510,7 +533,10 @@ class ArchiveDownloadWorker(QThread):
         if speed_limit_kbs:
             args[1:1] = ["--limit-rate", str(speed_limit_kbs * 1000)]
         self.progress.emit(f"{vod['title']} — E{segment + 1}, checkpoint {checkpoint + 1}")
-        return self._run_process(args, tracked_file=output.with_name(output.name + ".part"))
+        self.checkpoint_started.emit(str(vod["id"]), segment, checkpoint)
+        return self._run_process(
+            args, tracked_file=output.with_name(output.name + ".part"),
+            checkpoint_context=(str(vod["id"]), segment, checkpoint, finish - start))
 
     def _assemble_segment(self, vod: dict, segment: int, chunks: list[Path],
                           folder: Path, workspace: Path):
@@ -521,6 +547,13 @@ class ArchiveDownloadWorker(QThread):
         staging.unlink(missing_ok=True)
         args = [str(mgr.ffmpeg_bin()), "-y", "-hide_banner", "-f", "concat",
                 "-safe", "1", "-i", concat_list.name, "-map", "0", "-c", "copy",
+                # FFmpeg's range-cut files can carry Twitch's original HLS
+                # timestamps through each checkpoint. Concatenating those
+                # files verbatim inserts large timestamp gaps into the video
+                # track even though the audio and downloaded media are six
+                # hours long. Rebuild presentation timestamps from each
+                # packet's duration while retaining H.264 composition offsets.
+                "-bsf:v", "setts=pts=N*max(DURATION,1)+PTS-DTS:dts=N*max(DURATION,1)",
                 "-movflags", "+faststart", staging.name]
         code, failed, window_closed = self._run_process(args, cwd=workspace)
         if self._cancel or self._pause_requested or window_closed:

@@ -430,6 +430,7 @@ class MainWindow(QMainWindow):
         self._resume_after_pause = False
         self._speed_restart_jobs: set[str] = set()
         self._archive_manual_priority: dict | None = None
+        self._archive_checkpoint_times: dict[tuple[str, int, int], float] = {}
         self.archive_timer = QTimer(self)
         self.archive_timer.setInterval(30_000)
         self.archive_timer.timeout.connect(self._archive_tick)
@@ -741,6 +742,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_failed)
         worker.finished_ok.connect(self._on_finished)
         worker.start()
+        self._refresh_speed_limit_status()
 
     def _on_progress(self, jid: str, pct: float, speed: str, eta: str):
         row = self.rows.get(jid)
@@ -1066,6 +1068,7 @@ class MainWindow(QMainWindow):
         sl.addLayout(speed_actions)
         self.speed_limit_status = QLabel()
         self.speed_limit_status.setWordWrap(True)
+        self.speed_limit_status.setFixedHeight(42)
         sl.addWidget(self.speed_limit_status)
         self._refresh_speed_limit_status()
         lay.addWidget(speed)
@@ -1176,7 +1179,8 @@ class MainWindow(QMainWindow):
             "Completed segment files are checked automatically; check Uploaded after YouTube Studio, "
             "or use that segment's Delete button. Downloads save 15-minute checkpoints inside each six-hour segment, "
             "fetch up to six checkpoints concurrently, and join them without re-encoding. FFmpeg FPS/media speed is "
-            "processing rate; the output write rate is shown separately. "
+            "processing rate; aggregate output write rate and estimated hours downloaded appear in separate fixed "
+            "status lines. "
             "Set download speed in Settings. Install ffmpeg in the Download engine section.")
         archive_help.setWordWrap(True)
         al.addWidget(archive_help)
@@ -1211,10 +1215,21 @@ class MainWindow(QMainWindow):
         al.addWidget(selection_group)
         self.archive_current = QLabel("Current download: no segment is active.")
         self.archive_current.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.archive_current.setWordWrap(True)
+        self.archive_current.setWordWrap(False)
+        self.archive_current.setFixedHeight(24)
         al.addWidget(self.archive_current)
+        self.archive_media_progress = QLabel("Segment media downloaded: —")
+        self.archive_media_progress.setFixedHeight(24)
+        al.addWidget(self.archive_media_progress)
+        self.archive_download_speed = QLabel("Download speed: —")
+        self.archive_download_speed.setFixedHeight(24)
+        al.addWidget(self.archive_download_speed)
+        self.archive_engine_detail = QLabel("Download details: —")
+        self.archive_engine_detail.setFixedHeight(24)
+        al.addWidget(self.archive_engine_detail)
         self.archive_status = QLabel("No Twitch archive search yet.")
-        self.archive_status.setWordWrap(True)
+        self.archive_status.setWordWrap(False)
+        self.archive_status.setFixedHeight(24)
         al.addWidget(self.archive_status)
         self.archive_table = QTreeWidget()
         self.archive_table.setColumnCount(5)
@@ -1340,15 +1355,82 @@ class MainWindow(QMainWindow):
 
     def _refresh_speed_limit_status(self, message: str = ""):
         value = int(SETTINGS.get("download_speed_limit_kbs", 0))
-        text = f"Applied for new downloads: {self._speed_limit_label(value)}."
-        active = sum(1 for worker in self.workers.values()
-                     if worker.isRunning() and worker.job.state == "downloading")
-        archive_active = bool(self.archive_worker and self.archive_worker.isRunning())
-        if active or archive_active:
-            text += " Running downloads keep their current setting unless restarted."
-        if message:
-            text = f"{message} {text}"
+        text = f"Configured limit for new downloads: {self._speed_limit_label(value)}."
+        active_limits = [int(worker.job.speed_limit_kbs)
+                         for worker in self.workers.values()
+                         if worker.isRunning() and worker.job.state == "downloading"]
+        if self.archive_worker and self.archive_worker.isRunning():
+            active_limits.append(int(self.archive_worker.speed_limit_kbs))
+        if active_limits:
+            limits = list(dict.fromkeys(self._speed_limit_label(limit)
+                                        for limit in active_limits))
+            text += f" Active download limit(s): {', '.join(limits)}."
+        else:
+            text += " Active download limit: none."
+        self.speed_limit_status.setToolTip(message or text)
         self.speed_limit_status.setText(text)
+
+    def _archive_progress_changed(self, message: str):
+        self.archive_engine_detail.setText(message)
+        self.archive_engine_detail.setToolTip(message)
+
+    def _archive_download_speed_changed(self, value: str):
+        text = f"Download speed: {value} aggregate output write rate"
+        self.archive_download_speed.setText(text)
+        self.archive_download_speed.setToolTip(
+            "Measured from bytes written by active archive checkpoint files; "
+            "the value is shown separately from FFmpeg's FPS/media processing rate.")
+
+    @staticmethod
+    def _duration_label(seconds: float) -> str:
+        total_minutes = max(0, int(seconds // 60))
+        hours, minutes = divmod(total_minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def _archive_update_media_progress(self, vod: dict, segment: int):
+        archive = self._archive_settings()
+        folder = twitch_archive.vod_folder(archive.get("output_dir", ""), vod)
+        workspace = twitch_archive.checkpoint_workspace(folder, segment)
+        completed_ids = {
+            int(match.group(1))
+            for path in workspace.glob("checkpoint-*.mp4")
+            if path.is_file() and path.stat().st_size
+            and (match := re.fullmatch(r"checkpoint-(\d+)\.mp4", path.name))
+        }
+        completed = len(completed_ids)
+        complete_seconds = completed * twitch_archive.CHECKPOINT_SECONDS
+        active_seconds = sum(
+            seconds for (vod_id, current_segment, checkpoint), seconds
+            in self._archive_checkpoint_times.items()
+            if str(vod.get("id")) == vod_id and segment == current_segment
+            and checkpoint not in completed_ids)
+        segment_seconds = max(
+            0, min(twitch_archive.SEGMENT_SECONDS,
+                   int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                   - segment * twitch_archive.SEGMENT_SECONDS))
+        downloaded = min(segment_seconds, complete_seconds + active_seconds)
+        total = max(1, (segment_seconds + twitch_archive.CHECKPOINT_SECONDS - 1)
+                    // twitch_archive.CHECKPOINT_SECONDS)
+        status = "approx. " if active_seconds else ""
+        self.archive_media_progress.setText(
+            f"Segment media downloaded: {status}{self._duration_label(downloaded)} / "
+            f"{self._duration_label(segment_seconds)} "
+            f"({completed}/{total} checkpoints complete)")
+        self.archive_media_progress.setToolTip(
+            "Media time is estimated from completed 15-minute checkpoints and "
+            "FFmpeg's current checkpoint timestamp.")
+
+    def _archive_checkpoint_progress(self, vod_id: str, segment: int,
+                                     checkpoint: int, seconds: float):
+        key = (str(vod_id), int(segment), int(checkpoint))
+        self._archive_checkpoint_times[key] = max(
+            self._archive_checkpoint_times.get(key, 0.0), float(seconds))
+        _, vod = self._archive_find_vod(vod_id)
+        if vod is not None:
+            self._archive_update_media_progress(vod, segment)
+
+    def _archive_checkpoint_started(self, vod_id: str, segment: int, checkpoint: int):
+        self._archive_checkpoint_times[(str(vod_id), int(segment), int(checkpoint))] = 0.0
 
     def _apply_speed_limit_for_new_downloads(self):
         value = int(self.download_speed_limit.value())
@@ -1763,8 +1845,12 @@ class MainWindow(QMainWindow):
                 f"checkpoint {twitch_archive.completed_checkpoints(twitch_archive.vod_folder(self._archive_settings().get('output_dir', ''), active), segment)}/"
                 f"{twitch_archive.segment_checkpoint_count(active, segment)} - "
                 f"Twitch VOD ID {str(active.get('id', '')).removeprefix('v')}")
+            self.archive_current.setToolTip(self.archive_current.text())
+            self._archive_update_media_progress(active, segment)
         else:
             self.archive_current.setText("Current download: no segment is active.")
+            self.archive_current.setToolTip(self.archive_current.text())
+            self.archive_media_progress.setText("Segment media downloaded: —")
         if current_id:
             for row_index in range(self.archive_table.topLevelItemCount()):
                 parent = self.archive_table.topLevelItem(row_index)
@@ -2057,13 +2143,19 @@ class MainWindow(QMainWindow):
         self.archive_worker = ArchiveDownloadWorker(
             pending, a["output_dir"], a["start_time"], a["end_time"],
             float(a["max_gb"]), int(SETTINGS.get("download_speed_limit_kbs", 0)), self)
-        self.archive_worker.progress.connect(self.archive_status.setText)
+        self.archive_worker.progress.connect(self._archive_progress_changed)
+        self.archive_worker.download_speed.connect(self._archive_download_speed_changed)
+        self.archive_worker.checkpoint_started.connect(
+            self._archive_checkpoint_started)
+        self.archive_worker.checkpoint_progress.connect(
+            self._archive_checkpoint_progress)
         self.archive_worker.segment_started.connect(self._archive_segment_started)
         self.archive_worker.changed.connect(self._archive_state_changed)
         self.archive_worker.segment_done.connect(self._archive_segment_done)
         self.archive_worker.stopped.connect(self._archive_worker_stopped)
         self.archive_worker.finished.connect(self._archive_worker_finished)
         self.archive_worker.start()
+        self._refresh_speed_limit_status()
 
     def _set_archive_pause_button(self, paused: bool):
         self.archive_pause_button.setEnabled(not paused)
@@ -2099,6 +2191,9 @@ class MainWindow(QMainWindow):
     def _archive_worker_finished(self):
         self._rename_stream_id_segments()
         self._refresh_speed_limit_status()
+        if not self.archive_worker or not self.archive_worker.isRunning():
+            self.archive_download_speed.setText("Download speed: —")
+            self.archive_engine_detail.setText("Download details: —")
         if self._resume_after_pause and not self._archive_settings().get("paused", False):
             self._resume_after_pause = False
             QTimer.singleShot(0, self._archive_tick)
@@ -2110,6 +2205,10 @@ class MainWindow(QMainWindow):
                 twitch_archive.vod_folder(a.get("output_dir", ""), vod), vod)
 
     def _archive_segment_done(self, vod_id: str, segment: int):
+        self._archive_checkpoint_times = {
+            key: value for key, value in self._archive_checkpoint_times.items()
+            if key[:2] != (str(vod_id), int(segment))
+        }
         a = self._archive_settings()
         for vod in a.get("vods", []):
             if str(vod.get("id")) == str(vod_id):
