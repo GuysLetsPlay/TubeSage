@@ -9,7 +9,7 @@ on:
       version:
         description: Release version (for example 1.0.0)
         required: true
-        default: "1.2.7"
+        default: "1.2.8"
 
 permissions:
   contents: write
@@ -34,7 +34,7 @@ jobs:
       - name: Package TubeSage
         run: >-
           pyinstaller --noconfirm --clean --windowed --name TubeSage
-          --collect-all PySide6 --collect-all shiboken6
+          --collect-all PySide6 --collect-all shiboken6 --collect-all psutil
           --add-data "AGENT_PROMPT.md;." main.py
 
       - name: Install Inno Setup

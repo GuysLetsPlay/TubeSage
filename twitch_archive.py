@@ -14,6 +14,7 @@ from datetime import date, datetime, time as clock_time
 import math
 from pathlib import Path
 
+import psutil
 from PySide6.QtCore import QThread, Signal
 
 import ytdlp_manager as mgr
@@ -348,6 +349,10 @@ class ArchiveDownloadWorker(QThread):
         self._rate_users: dict[str, int] = {}
         self._process_output_sizes: dict[int, tuple[float, int]] = {}
         self._process_rates: dict[int, tuple[float, float]] = {}
+        self._adapter_rate_lock = threading.Lock()
+        self._adapter_receive_bytes: dict[str, int] = {}
+        self._adapter_sample_time = 0.0
+        self._adapter_receive_rate = 0.0
         self._window_closed = threading.Event()
         self._storage_full = threading.Event()
         self._segment_failed = threading.Event()
@@ -472,6 +477,36 @@ class ArchiveDownloadWorker(QThread):
             return sum(rate for stamp, rate in self._process_rates.values()
                        if now - stamp <= 4.0)
 
+    def _sample_adapter_receive_rate(self, now: float) -> float:
+        """Read OS network-interface counters when downloader progress is absent.
+
+        FFmpeg may receive HLS data without promptly growing its output file or
+        reporting output progress. Use the busiest interface rather than
+        summing all interfaces, which can double-count VPN and virtual traffic.
+        """
+        with self._adapter_rate_lock:
+            if now - self._adapter_sample_time < 0.75:
+                return self._adapter_receive_rate
+            try:
+                current = {
+                    name: int(stats.bytes_recv)
+                    for name, stats in
+                    (psutil.net_io_counters(pernic=True) or {}).items()
+                }
+            except (OSError, RuntimeError):
+                return self._adapter_receive_rate
+            elapsed = now - self._adapter_sample_time
+            rates = []
+            if elapsed > 0 and self._adapter_sample_time:
+                for name, received in current.items():
+                    previous = self._adapter_receive_bytes.get(name)
+                    if previous is not None and received >= previous:
+                        rates.append((received - previous) / elapsed / (1024 ** 2))
+            self._adapter_receive_bytes = current
+            self._adapter_sample_time = now
+            self._adapter_receive_rate = max(rates, default=0.0)
+            return self._adapter_receive_rate
+
     def _wait_for_window(self) -> bool:
         while (not self._cancel and not self._pause_requested
                and not schedule_open(self.start_time, self.end_time)):
@@ -557,11 +592,13 @@ class ArchiveDownloadWorker(QThread):
                     progress_rate = self._progress_line_rate(
                         process.pid, clean, time.monotonic())
                     if progress_rate is not None:
-                        output_rate = self._sample_output_rate(
-                            rate_key, rate_workspace, time.monotonic()) \
-                            if rate_key and rate_workspace else 0.0
+                        sample_time = time.monotonic()
+                        output_rate = (self._sample_output_rate(
+                            rate_key, rate_workspace, sample_time)
+                            if rate_key and rate_workspace else 0.0)
+                        adapter_rate = self._sample_adapter_receive_rate(sample_time)
                         self.download_speed.emit(
-                            f"{max(progress_rate, output_rate):.2f} MiB/s")
+                            f"{max(progress_rate, output_rate, adapter_rate):.2f} MiB/s")
                     fps = re.search(r"\bfps=\s*([\d.]+)", clean)
                     ffmpeg_speed = re.search(r"\bspeed=\s*([^\s]+)", clean)
                     media_time = re.search(
@@ -585,7 +622,7 @@ class ArchiveDownloadWorker(QThread):
                 if rate_key and rate_workspace and now - last_rate_check >= 1.0:
                     rate_mib = self._sample_output_rate(rate_key, rate_workspace, now)
                     self.download_speed.emit(
-                        f"{max(rate_mib, self._current_process_rate(now)):.2f} MiB/s")
+                        f"{max(rate_mib, self._current_process_rate(now), self._sample_adapter_receive_rate(now)):.2f} MiB/s")
                     last_rate_check = now
             code = process.wait()
             if self._window_closed.is_set():

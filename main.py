@@ -1179,7 +1179,7 @@ class MainWindow(QMainWindow):
             "Completed segment files are checked automatically; check Uploaded after YouTube Studio, "
             "or use that segment's Delete button. Downloads save 15-minute checkpoints inside each six-hour segment, "
             "fetch up to six checkpoints concurrently, and join them without re-encoding. FFmpeg FPS/media speed is "
-            "processing rate; transfer speed and estimated hours downloaded appear in separate fixed "
+            "processing rate; network receive speed and estimated hours downloaded appear in separate fixed "
             "status lines. "
             "Set download speed in Settings. Install ffmpeg in the Download engine section.")
         archive_help.setWordWrap(True)
@@ -1388,9 +1388,11 @@ class MainWindow(QMainWindow):
         text = f"Download speed: {value}"
         self.archive_download_speed.setText(text)
         self.archive_download_speed.setToolTip(
-            "Measured from yt-dlp transfer progress, FFmpeg output progress, or "
-            "checkpoint file growth. Parallel checkpoint rates are combined. "
-            "This is separate from FFmpeg's FPS/media processing rate.")
+            "Uses yt-dlp/FFmpeg progress or checkpoint file growth where available. "
+            "When those omit transfer speed, it uses receive-byte counters from "
+            "the busiest network adapter while archive downloads are active. "
+            "Other traffic on that adapter can contribute. This is separate "
+            "from FFmpeg's FPS/media processing rate.")
 
     @staticmethod
     def _duration_label(seconds: float) -> str:
