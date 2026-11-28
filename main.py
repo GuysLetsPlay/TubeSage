@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget, QDateEdit,
-    QHeaderView, QDoubleSpinBox, QTimeEdit, QSpinBox)
+    QHeaderView, QDoubleSpinBox, QTimeEdit, QSpinBox, QSizePolicy)
 from PySide6.QtWidgets import QScrollArea
 
 from app_paths import DATA_DIR
@@ -1217,19 +1217,29 @@ class MainWindow(QMainWindow):
         self.archive_current.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.archive_current.setWordWrap(False)
         self.archive_current.setFixedHeight(24)
+        self.archive_current.setMinimumWidth(0)
+        self.archive_current.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         al.addWidget(self.archive_current)
         self.archive_media_progress = QLabel("Segment media downloaded: —")
         self.archive_media_progress.setFixedHeight(24)
+        self.archive_media_progress.setMinimumWidth(0)
+        self.archive_media_progress.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         al.addWidget(self.archive_media_progress)
         self.archive_download_speed = QLabel("Download speed: —")
         self.archive_download_speed.setFixedHeight(24)
+        self.archive_download_speed.setMinimumWidth(0)
+        self.archive_download_speed.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         al.addWidget(self.archive_download_speed)
         self.archive_engine_detail = QLabel("Download details: —")
         self.archive_engine_detail.setFixedHeight(24)
+        self.archive_engine_detail.setMinimumWidth(0)
+        self.archive_engine_detail.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         al.addWidget(self.archive_engine_detail)
         self.archive_status = QLabel("No Twitch archive search yet.")
         self.archive_status.setWordWrap(False)
         self.archive_status.setFixedHeight(24)
+        self.archive_status.setMinimumWidth(0)
+        self.archive_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         al.addWidget(self.archive_status)
         self.archive_table = QTreeWidget()
         self.archive_table.setColumnCount(5)

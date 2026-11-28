@@ -341,7 +341,11 @@ class ArchiveDownloadWorker(QThread):
         self._processes: set[subprocess.Popen] = set()
         self._process_lock = threading.Lock()
         self._rate_lock = threading.Lock()
-        self._rate_samples: dict[str, tuple[float, float]] = {}
+        # Rate is measured from changing bytes anywhere in each active
+        # checkpoint workspace. yt-dlp's .part file can be only a tiny
+        # metadata marker when FFmpeg writes the media output directly.
+        self._rate_samples: dict[str, tuple[float, int, float]] = {}
+        self._rate_users: dict[str, int] = {}
         self._window_closed = threading.Event()
         self._storage_full = threading.Event()
         self._segment_failed = threading.Event()
@@ -366,6 +370,55 @@ class ArchiveDownloadWorker(QThread):
         with ThreadPoolExecutor(max_workers=len(processes)) as pool:
             list(pool.map(stop_process_tree, processes))
 
+    @staticmethod
+    def _workspace_bytes(workspace: Path) -> int:
+        try:
+            return sum(path.stat().st_size for path in workspace.iterdir()
+                       if path.is_file())
+        except OSError:
+            return 0
+
+    def _begin_rate_tracking(self, workspace: Path) -> str:
+        key = str(workspace)
+        now = time.monotonic()
+        with self._rate_lock:
+            users = self._rate_users.get(key, 0)
+            if users == 0:
+                self._rate_samples[key] = (now, self._workspace_bytes(workspace), 0.0)
+            self._rate_users[key] = users + 1
+        return key
+
+    def _sample_output_rate(self, key: str, workspace: Path,
+                            now: float) -> float:
+        with self._rate_lock:
+            previous = self._rate_samples.get(key)
+            if previous is None:
+                self._rate_samples[key] = (now, self._workspace_bytes(workspace), 0.0)
+                rate = 0.0
+            else:
+                previous_time, previous_bytes, previous_rate = previous
+                elapsed = now - previous_time
+                if elapsed >= 0.75:
+                    current_bytes = self._workspace_bytes(workspace)
+                    rate = max(0.0, (current_bytes - previous_bytes)
+                               / elapsed / (1024 ** 2))
+                    self._rate_samples[key] = (now, current_bytes, rate)
+                else:
+                    rate = previous_rate
+            active_rates = [sample[2] for workspace_key, sample
+                            in self._rate_samples.items()
+                            if self._rate_users.get(workspace_key, 0) > 0]
+            return sum(active_rates)
+
+    def _end_rate_tracking(self, key: str) -> None:
+        with self._rate_lock:
+            users = self._rate_users.get(key, 0) - 1
+            if users <= 0:
+                self._rate_users.pop(key, None)
+                self._rate_samples.pop(key, None)
+            else:
+                self._rate_users[key] = users
+
     def _wait_for_window(self) -> bool:
         while (not self._cancel and not self._pause_requested
                and not schedule_open(self.start_time, self.end_time)):
@@ -384,6 +437,7 @@ class ArchiveDownloadWorker(QThread):
         window_closed = False
         process: subprocess.Popen | None = None
         reader: threading.Thread | None = None
+        rate_key = None
         try:
             process = subprocess.Popen(
                 args, cwd=str(cwd) if cwd else None, stdout=subprocess.PIPE,
@@ -391,6 +445,9 @@ class ArchiveDownloadWorker(QThread):
                 creationflags=subprocess.CREATE_NO_WINDOW)
             with self._process_lock:
                 self._processes.add(process)
+            rate_workspace = tracked_file.parent if tracked_file else None
+            if rate_workspace:
+                rate_key = self._begin_rate_tracking(rate_workspace)
             output_lines: queue.Queue[str] = queue.Queue()
 
             def read_output():
@@ -421,7 +478,6 @@ class ArchiveDownloadWorker(QThread):
                 stop_process_tree(process)
             last_size_check = time.monotonic()
             last_rate_check = time.monotonic()
-            last_rate_size = 0
             while (process.poll() is None and not self._cancel
                    and not self._pause_requested and not self._segment_failed.is_set()
                    and not self._window_closed.is_set() and not self._storage_full.is_set()):
@@ -465,22 +521,10 @@ class ArchiveDownloadWorker(QThread):
                     else:
                         self.progress.emit(clean[-220:])
                 now = time.monotonic()
-                if tracked_file and now - last_rate_check >= 1.0:
-                    try:
-                        current_size = tracked_file.stat().st_size
-                    except OSError:
-                        current_size = last_rate_size
-                    elapsed = now - last_rate_check
-                    if current_size >= last_rate_size and elapsed > 0:
-                        rate_mib = (current_size - last_rate_size) / elapsed / (1024 ** 2)
-                        with self._rate_lock:
-                            self._rate_samples[str(tracked_file)] = (now, rate_mib)
-                            active_rates = [rate for stamp, rate in self._rate_samples.values()
-                                            if now - stamp <= 4.0]
-                        self.download_speed.emit(
-                            f"{sum(active_rates):.2f} MiB/s")
+                if rate_key and rate_workspace and now - last_rate_check >= 1.0:
+                    rate_mib = self._sample_output_rate(rate_key, rate_workspace, now)
+                    self.download_speed.emit(f"{rate_mib:.2f} MiB/s")
                     last_rate_check = now
-                    last_rate_size = current_size
             code = process.wait()
             if self._window_closed.is_set():
                 window_closed = True
@@ -498,9 +542,8 @@ class ArchiveDownloadWorker(QThread):
                         process.stdout.close()
                     except OSError:
                         pass
-                if tracked_file:
-                    with self._rate_lock:
-                        self._rate_samples.pop(str(tracked_file), None)
+                if rate_key:
+                    self._end_rate_tracking(rate_key)
                 with self._process_lock:
                     self._processes.discard(process)
 
