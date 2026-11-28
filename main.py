@@ -17,8 +17,8 @@ from pathlib import Path
 
 from PySide6.QtCore import (QByteArray, QObject, QPoint, QSize, Qt, QThread,
                             QTimer, QUrl, Signal, QDate)
-from PySide6.QtGui import (QColor, QFont, QIcon, QPainter, QPen, QPixmap,
-                           QPolygon)
+from PySide6.QtGui import (QBrush, QColor, QFont, QGradient, QIcon,
+                           QLinearGradient, QPainter, QPen, QPixmap, QPolygon)
 from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkReply,
                                QNetworkRequest)
 from PySide6.QtWidgets import (
@@ -44,6 +44,8 @@ from twitch_archive import ArchiveDownloadWorker, VodSearchWorker
 # file types the "watch now" folder-scan considers playable
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".mp3",
               ".m4a", ".opus", ".ogg", ".wav", ".flac"}
+ARCHIVE_PROGRESS_ROLE = Qt.UserRole + 2
+ARCHIVE_BASE_TOOLTIP_ROLE = Qt.UserRole + 3
 from error_doctor import extract_signature
 from agent_launcher import detect_cli, launch_deep_search
 
@@ -1400,9 +1402,120 @@ class MainWindow(QMainWindow):
         hours, minutes = divmod(total_minutes, 60)
         return f"{hours}h {minutes:02d}m"
 
+    def _archive_segment_downloaded_seconds(self, vod: dict, segment: int,
+                                            folder: Path | None = None):
+        archive = self._archive_settings()
+        folder = folder or twitch_archive.vod_folder(
+            archive.get("output_dir", ""), vod)
+        segment_seconds = max(
+            0, min(twitch_archive.SEGMENT_SECONDS,
+                   int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
+                   - segment * twitch_archive.SEGMENT_SECONDS))
+        checkpoint_total = max(
+            1, (segment_seconds + twitch_archive.CHECKPOINT_SECONDS - 1)
+            // twitch_archive.CHECKPOINT_SECONDS)
+        done = {int(value) for value in vod.get("segments_done", [])}
+        uploaded = {int(value) for value in vod.get("segments_uploaded", [])}
+        files = twitch_archive.segment_files(folder, vod, segment)
+        if (segment in done or segment in uploaded
+                or any(not path.name.endswith((".part", ".ytdl")) for path in files)):
+            return segment_seconds, segment_seconds, checkpoint_total
+
+        workspace = twitch_archive.checkpoint_workspace(folder, segment)
+        completed_ids = {
+            int(match.group(1))
+            for path in workspace.glob("checkpoint-*.mp4")
+            if path.is_file() and path.stat().st_size
+            and (match := re.fullmatch(r"checkpoint-(\d+)\.mp4", path.name))
+            and 0 <= int(match.group(1)) < checkpoint_total
+        }
+        complete_seconds = len(completed_ids) * twitch_archive.CHECKPOINT_SECONDS
+        active_seconds = sum(
+            seconds for (vod_id, current_segment, checkpoint), seconds
+            in self._archive_checkpoint_times.items()
+            if str(vod.get("id")) == vod_id and segment == current_segment
+            and checkpoint not in completed_ids)
+        downloaded = min(segment_seconds, complete_seconds + active_seconds)
+        return downloaded, segment_seconds, checkpoint_total
+
+    def _archive_vod_downloaded_seconds(self, vod: dict) -> tuple[int, int]:
+        archive = self._archive_settings()
+        folder = twitch_archive.vod_folder(archive.get("output_dir", ""), vod)
+        duration = max(1, int(vod.get("duration")
+                          or twitch_archive.SEGMENT_SECONDS))
+        count = max(1, (duration + twitch_archive.SEGMENT_SECONDS - 1)
+                    // twitch_archive.SEGMENT_SECONDS)
+        downloaded = sum(
+            self._archive_segment_downloaded_seconds(vod, segment, folder)[0]
+            for segment in range(count))
+        return min(duration, downloaded), duration
+
+    def _archive_progress_brush(self, progress: float) -> QBrush:
+        ratio = max(0.0, min(1.0, float(progress)))
+        base = self.archive_table.palette().base().color()
+        track = base.lighter(118)
+        fill = QColor(55, 145, 225, 105)
+        gradient = QLinearGradient(0, 0, 1, 0)
+        gradient.setCoordinateMode(QGradient.ObjectBoundingMode)
+        if ratio <= 0:
+            gradient.setColorAt(0, track)
+            gradient.setColorAt(1, track)
+        elif ratio >= 1:
+            gradient.setColorAt(0, fill)
+            gradient.setColorAt(1, fill)
+        else:
+            gradient.setColorAt(0, fill)
+            gradient.setColorAt(ratio, fill)
+            gradient.setColorAt(min(1.0, ratio + 0.004), track)
+            gradient.setColorAt(1, track)
+        return QBrush(gradient)
+
+    def _set_archive_item_progress(self, item: QTreeWidgetItem,
+                                   progress: float, downloaded: int,
+                                   total: int):
+        ratio = max(0.0, min(1.0, progress))
+        item.setData(0, ARCHIVE_PROGRESS_ROLE, ratio)
+        item.setBackground(0, self._archive_progress_brush(ratio))
+        base_tooltip = item.data(0, ARCHIVE_BASE_TOOLTIP_ROLE)
+        if base_tooltip is None:
+            base_tooltip = item.toolTip(0)
+            item.setData(0, ARCHIVE_BASE_TOOLTIP_ROLE, base_tooltip)
+        progress_tooltip = (
+            f"Downloaded media: {self._duration_label(downloaded)} of "
+            f"{self._duration_label(total)}")
+        item.setToolTip(
+            0, f"{base_tooltip}\n{progress_tooltip}"
+            if base_tooltip else progress_tooltip)
+
+    def _archive_update_progress_bars(self, vod: dict, segment: int | None = None):
+        vod_id = str(vod.get("id", ""))
+        downloaded, total = self._archive_vod_downloaded_seconds(vod)
+        for row in range(self.archive_table.topLevelItemCount()):
+            parent = self.archive_table.topLevelItem(row)
+            if str(parent.data(0, Qt.UserRole)) != vod_id:
+                continue
+            self._set_archive_item_progress(parent, downloaded / total,
+                                            downloaded, total)
+            if segment is not None:
+                for child_index in range(parent.childCount()):
+                    child = parent.child(child_index)
+                    if child.data(0, Qt.UserRole + 1) != segment:
+                        continue
+                    segment_downloaded, segment_total, _ = (
+                        self._archive_segment_downloaded_seconds(vod, segment))
+                    self._set_archive_item_progress(
+                        child, segment_downloaded / max(1, segment_total),
+                        segment_downloaded, segment_total)
+                break
+
     def _archive_update_media_progress(self, vod: dict, segment: int):
         archive = self._archive_settings()
         folder = twitch_archive.vod_folder(archive.get("output_dir", ""), vod)
+        downloaded, segment_seconds, checkpoint_total = (
+            self._archive_segment_downloaded_seconds(vod, segment, folder))
+        checkpoint_done = min(
+            checkpoint_total,
+            twitch_archive.completed_checkpoints(folder, segment))
         workspace = twitch_archive.checkpoint_workspace(folder, segment)
         completed_ids = {
             int(match.group(1))
@@ -1410,28 +1523,20 @@ class MainWindow(QMainWindow):
             if path.is_file() and path.stat().st_size
             and (match := re.fullmatch(r"checkpoint-(\d+)\.mp4", path.name))
         }
-        completed = len(completed_ids)
-        complete_seconds = completed * twitch_archive.CHECKPOINT_SECONDS
         active_seconds = sum(
             seconds for (vod_id, current_segment, checkpoint), seconds
             in self._archive_checkpoint_times.items()
             if str(vod.get("id")) == vod_id and segment == current_segment
             and checkpoint not in completed_ids)
-        segment_seconds = max(
-            0, min(twitch_archive.SEGMENT_SECONDS,
-                   int(vod.get("duration") or twitch_archive.SEGMENT_SECONDS)
-                   - segment * twitch_archive.SEGMENT_SECONDS))
-        downloaded = min(segment_seconds, complete_seconds + active_seconds)
-        total = max(1, (segment_seconds + twitch_archive.CHECKPOINT_SECONDS - 1)
-                    // twitch_archive.CHECKPOINT_SECONDS)
         status = "approx. " if active_seconds else ""
         self.archive_media_progress.setText(
             f"Segment media downloaded: {status}{self._duration_label(downloaded)} / "
             f"{self._duration_label(segment_seconds)} "
-            f"({completed}/{total} checkpoints complete)")
+            f"({checkpoint_done}/{checkpoint_total} checkpoints complete)")
         self.archive_media_progress.setToolTip(
             "Media time is estimated from completed 15-minute checkpoints and "
             "FFmpeg's current checkpoint timestamp.")
+        self._archive_update_progress_bars(vod, segment)
 
     def _archive_checkpoint_progress(self, vod_id: str, segment: int,
                                      checkpoint: int, seconds: float):
@@ -1776,6 +1881,9 @@ class MainWindow(QMainWindow):
                                  else Qt.Unchecked)
             parent.setToolTip(0, f"{vod.get('url', '')}\nVOD ID {vod_id} · "
                                  f"Stream ID {stream_id or 'not resolved'}")
+            vod_downloaded, vod_duration = self._archive_vod_downloaded_seconds(vod)
+            self._set_archive_item_progress(
+                parent, vod_downloaded / vod_duration, vod_downloaded, vod_duration)
             if stream_id:
                 details = f"{details} · Stream ID {stream_id}" if details else f"Stream ID {stream_id}"
                 parent.setText(4, details)
@@ -1803,8 +1911,14 @@ class MainWindow(QMainWindow):
                 child = QTreeWidgetItem([label, "", "", "", ""])
                 child.setData(0, Qt.UserRole, vod_id)
                 child.setData(0, Qt.UserRole + 1, segment)
+                child.setToolTip(0, f"VOD ID {vod_id} · Episode {segment + 1}")
                 child.setFlags(child.flags() & ~Qt.ItemIsSelectable)
                 parent.addChild(child)
+                segment_seconds, segment_duration, _ = (
+                    self._archive_segment_downloaded_seconds(vod, segment, folder))
+                self._set_archive_item_progress(
+                    child, segment_seconds / max(1, segment_duration),
+                    segment_seconds, segment_duration)
                 downloaded_box = QCheckBox("Downloaded")
                 downloaded_box.setChecked(downloaded)
                 downloaded_box.setEnabled(False)
